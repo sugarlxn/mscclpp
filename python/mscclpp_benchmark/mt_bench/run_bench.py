@@ -42,6 +42,7 @@ from nccl_op import NcclAllReduce  # noqa: E402
 from mscclpp import ProxyService, is_nvls_supported, CommGroup, GpuBuffer  # noqa: E402
 from mscclpp.ext.tenant import (  # noqa: E402
     TenantScheduler, PolicyMode, QoSClass, build_policy, WorkItem,
+    TenantAwareProxyService, register_tenant_on,
 )
 
 
@@ -291,7 +292,9 @@ def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
                      group, nccl_comm, dtype, comm, rank, results, run_id,
                      mode=PolicyMode.FAIR, qos_classes=None,
                      bandwidth_caps_bps=None,
-                     enforce_rate_limit=False):
+                     enforce_rate_limit=False,
+                     weights=None,
+                     use_cpp_proxy=True):
     """Emulate K tenants sharing the same comm by interleaving their AllReduce.
 
     Iter 2 design (design.md §5.3, §6.3):
@@ -305,7 +308,15 @@ def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
     This fixes iter1 limitation #1 (no CUDA graphs in MT path) by separating
     "what to schedule" (CPU, ahead of time) from "when to launch" (GPU graph).
     """
-    proxy_service = ProxyService()
+    # Iter 3: use the C++ TenantAwareProxyService (drop-in for ProxyService).
+    # In iter 3 the scheduling REORDERING still happens via Python plan_order
+    # (because per-tenant device handles aren't plumbed into the algos yet);
+    # but ProxyService is now the C++ tenant-aware one, so iter 4 can flip the
+    # switch to in-proxy scheduling with no benchmark changes.
+    if use_cpp_proxy:
+        proxy_service = TenantAwareProxyService(mode=mode)
+    else:
+        proxy_service = ProxyService()
     proxy_service.start_proxy()
     try:
         for nelems in sizes:
@@ -318,19 +329,28 @@ def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
             qos_classes = qos_classes or [QoSClass.STANDARD] * num_tenants
             caps = list(bandwidth_caps_bps) if bandwidth_caps_bps \
                    else [0] * num_tenants
+            weights_eff = list(weights) if weights else [1] * num_tenants
 
             tenant_specs = []
             for tid in range(1, num_tenants + 1):
                 tenant_specs.append({
                     "tenant_id": tid,
                     "qos_class": int(qos_classes[tid - 1]),
-                    "weight": 100 if qos_classes[tid - 1] == QoSClass.STANDARD
-                              else 200,
+                    "weight": int(weights_eff[tid - 1]),
                     "bandwidth_max_bps": int(caps[tid - 1]),
                 })
             table = build_policy(mode, tenant_specs)
             sched = TenantScheduler(table, mode=mode,
                                     enforce_rate_limit=enforce_rate_limit)
+
+            # Also register tenants with the C++ proxy (no-op for data path
+            # today; iter 4 will route triggers through the C++ scheduler).
+            if use_cpp_proxy:
+                for spec in tenant_specs:
+                    register_tenant_on(proxy_service, spec["tenant_id"],
+                                       QoSClass(spec["qos_class"]),
+                                       spec["weight"],
+                                       spec["bandwidth_max_bps"], 0)
             comm.barrier()
 
             # warmup once outside the graph
@@ -420,9 +440,9 @@ def main():
                         help="comma-separated element counts")
     parser.add_argument("--niter", type=int, default=50)
     parser.add_argument("--scenarios", type=str,
-                        default="single,multi2,priority,rate_limited",
+                        default="single,multi2,priority,rate_limited,weighted_fair",
                         help="comma list from: single, multi2, multi4, "
-                             "priority, rate_limited")
+                             "priority, rate_limited, weighted_fair")
     parser.add_argument("--rate-cap-gbps", type=float, default=30.0,
                         help="tenant-2 bandwidth cap in GB/s for rate_limited "
                              "scenario (default 30)")
@@ -477,10 +497,20 @@ def main():
 
     if "multi2" in scenarios:
         if rank == 0:
-            print("\n--- scenario: multi_tenant_2x (FAIR) ---", flush=True)
+            print("\n--- scenario: multi_tenant_2x (FAIR, equal weights) ---",
+                  flush=True)
         run_multi_tenant("multi_tenant_2x_fair", 2, sizes, args.niter,
                          group, nccl_comm, dtype, comm, rank, results, run_id,
                          mode=PolicyMode.FAIR)
+
+    if "weighted_fair" in scenarios:
+        if rank == 0:
+            print("\n--- scenario: weighted_fair (tenant 1 weight=1, tenant 2 weight=3) ---",
+                  flush=True)
+        run_multi_tenant("weighted_fair_1to3", 2, sizes, args.niter,
+                         group, nccl_comm, dtype, comm, rank, results, run_id,
+                         mode=PolicyMode.FAIR,
+                         weights=[1, 3])
 
     if "multi4" in scenarios:
         if rank == 0:

@@ -14,6 +14,12 @@ namespace mscclpp {
 struct BasePortChannel;
 struct PortChannel;
 
+/// MT-MSCCL++: a decorator that wraps the ProxyService's internal trigger
+/// handler with custom logic (e.g. tenant-aware scheduling). The decorator
+/// receives the inner handler and returns a new outer handler. See
+/// include/mscclpp/ext/tenant_aware_proxy.hpp for the canonical use.
+using ProxyHandlerDecorator = std::function<ProxyHandler(ProxyHandler)>;
+
 /// Base class for proxy services. Proxy services are used to proxy data between devices.
 class BaseProxyService {
  public:
@@ -72,12 +78,24 @@ class ProxyService : public BaseProxyService {
   /// @return The port channel.
   PortChannel portChannel(SemaphoreId id, MemoryId dst, MemoryId src);
 
+  /// Install a decorator that wraps the proxy's trigger handler. MUST be
+  /// called BEFORE startProxy(). The decorator is invoked once with the
+  /// ProxyService's own handler as `inner`; the returned callable replaces
+  /// the proxy thread's trigger handler. Used by MT-MSCCL++ to inject
+  /// tenant-aware scheduling. design.md §5.3 / §7.1.
+  void setHandlerDecorator(ProxyHandlerDecorator decorator);
+
   /// Start the proxy service.
   /// @param blocking Whether to block until the proxy thread has started (default: false).
   void startProxy(bool blocking = false);
 
   /// Stop the proxy service.
   void stopProxy();
+
+ protected:
+  // Exposed to subclasses (e.g. TenantAwareProxyService) for handler-rewrap.
+  std::shared_ptr<Proxy>& proxy() { return proxy_; }
+  ProxyHandlerResult dispatchTrigger(ProxyTrigger t) { return handleTrigger(t); }
 
  private:
   std::vector<std::shared_ptr<Host2DeviceSemaphore>> semaphores_;

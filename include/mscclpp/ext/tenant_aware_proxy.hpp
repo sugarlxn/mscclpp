@@ -32,6 +32,7 @@
 
 #include <mscclpp/ext/tenant.hpp>
 #include <mscclpp/fifo_device.hpp>
+#include <mscclpp/port_channel.hpp>
 #include <mscclpp/proxy.hpp>
 
 namespace mscclpp {
@@ -44,6 +45,19 @@ class TokenBucket {
   TokenBucket() = default;
   TokenBucket(uint64_t refillBps, uint64_t burstBytes)
       : refillBps_(refillBps), burstBytes_(burstBytes), tokens_(static_cast<double>(burstBytes)) {
+    lastNs_ = nowNs();
+  }
+
+  // Non-copyable, non-movable (std::mutex member).
+  TokenBucket(const TokenBucket&) = delete;
+  TokenBucket& operator=(const TokenBucket&) = delete;
+
+  /// Reset parameters in place (avoids copy-assign that std::mutex disallows).
+  void reset(uint64_t refillBps, uint64_t burstBytes) {
+    std::lock_guard<std::mutex> g(mu_);
+    refillBps_ = refillBps;
+    burstBytes_ = burstBytes;
+    tokens_ = static_cast<double>(burstBytes);
     lastNs_ = nowNs();
   }
 
@@ -98,13 +112,17 @@ class TenantAwareProxyHandler {
   TenantAwareProxyHandler(ProxyHandler inner, PolicyMode mode = PolicyMode::SinglePassthrough)
       : inner_(std::move(inner)), mode_(mode) {}
 
+  /// Re-point the inner handler (used by TenantAwareProxyService, where the
+  /// handler is created before the inner is known).
+  void setInner(ProxyHandler inner) { inner_ = std::move(inner); }
+
   /// Register / update a tenant. Thread-safe.
   void updateTenant(const TenantContext& ctx, const BandwidthBudget& budget) {
     if (ctx.tenant_id >= MAX_TENANTS) return;
     std::lock_guard<std::mutex> g(mu_);
     tenants_[ctx.tenant_id] = ctx;
     budgets_[ctx.tenant_id] = budget;
-    buckets_[ctx.tenant_id] = TokenBucket(budget.bytes_per_second, budget.burst_bytes);
+    buckets_[ctx.tenant_id].reset(budget.bytes_per_second, budget.burst_bytes);
     activeMask_.fetch_or(uint32_t{1} << ctx.tenant_id, std::memory_order_release);
   }
 
@@ -236,6 +254,57 @@ class TenantAwareProxyHandler {
   std::array<BandwidthBudget, MAX_TENANTS> budgets_{};
   std::array<TokenBucket, MAX_TENANTS> buckets_{};
   uint32_t rrCursor_ = 0;
+};
+
+/// A ProxyService that runs TenantAwareProxyHandler in the proxy thread.
+///
+/// Use exactly like ProxyService — `addSemaphore`, `addMemory`, `portChannel`,
+/// `startProxy`, `stopProxy` are inherited. The MT extension is:
+///
+///   svc.updateTenant({tid, qos, weight, ...}, {refill_bps, burst});
+///   svc.setMode(PolicyMode::Fair);
+///
+/// Once `startProxy()` is called the proxy thread automatically multiplexes
+/// incoming triggers by `trigger.fields.tenantId` (set by the GPU-side channel
+/// handles via include/mscclpp/port_channel_device.hpp).
+///
+/// CRITICAL for CUDA-graph capture: because all scheduling happens INSIDE the
+/// proxy thread, the GPU side and host launch site see no extra synchronization
+/// or callbacks per kernel — so the multi-tenant path is fully graph-capturable
+/// in iter 3 (fixes iter 2 limitation #1).
+class TenantAwareProxyService : public ProxyService {
+ public:
+  TenantAwareProxyService(PolicyMode mode = PolicyMode::SinglePassthrough, int fifoSize = DEFAULT_FIFO_SIZE)
+      : ProxyService(fifoSize),
+        handler_(std::make_shared<TenantAwareProxyHandler>(ProxyHandler{}, mode)) {
+    // The decorator captures handler_ (constructed BEFORE this lambda runs)
+    // and installs it as the proxy's outer handler.
+    auto h = handler_;
+    setHandlerDecorator([h](ProxyHandler inner) {
+      h->setInner(std::move(inner));
+      return h->asHandler();
+    });
+  }
+
+  /// Register or update a tenant's policy and rate-limit budget. Thread-safe
+  /// and may be called while the proxy is running.
+  void updateTenant(const TenantContext& ctx, const BandwidthBudget& budget) { handler_->updateTenant(ctx, budget); }
+
+  /// Convenience: register a tenant with rate-limit specified directly.
+  void registerTenant(TenantId tenantId, QoSClass qos, uint32_t weight, uint64_t bandwidthMaxBps = 0,
+                      uint64_t burstBytes = 0) {
+    TenantContext ctx{tenantId, qos, weight, 0, 0, bandwidthMaxBps, 0};
+    BandwidthBudget bud{bandwidthMaxBps, burstBytes ? burstBytes : (bandwidthMaxBps ? bandwidthMaxBps / 10 : 0), 0};
+    handler_->updateTenant(ctx, bud);
+  }
+
+  void removeTenant(TenantId tenantId) { handler_->removeTenant(tenantId); }
+
+  void setMode(PolicyMode mode) { handler_->setMode(mode); }
+  PolicyMode mode() const { return handler_->mode(); }
+
+ private:
+  std::shared_ptr<TenantAwareProxyHandler> handler_;
 };
 
 }  // namespace tenant

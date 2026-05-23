@@ -29,6 +29,7 @@ extern void register_algorithm(nb::module_& m);
 
 // ext
 extern void register_algorithm_collection_builder(nb::module_& m);
+extern void register_tenant(nb::module_& m);  // MT-MSCCL++ (design.md §3.5 / §5)
 
 template <typename T>
 void def_shared_future(nb::handle& m, const std::string& typestr) {
@@ -330,4 +331,5 @@ NB_MODULE(_mscclpp, m) {
 
   // ext
   register_algorithm_collection_builder(m);
+  register_tenant(m);  // MT-MSCCL++
 }

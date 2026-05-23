@@ -378,13 +378,12 @@ class TenantScheduler:
         for it in items:
             local_queues.setdefault(it.tenant_id, deque()).append(it)
         local_deficits: dict[int, int] = {tid: 0 for tid in local_queues}
-        # Effective per-round quantum: max(self.quantum, mean(item_size)).
-        # This guarantees roughly 1-item-per-round when items are uniform
-        # (typical for AllReduce benchmark), preserving fine-grained
-        # interleaving. Larger weights still get served proportionally more.
+        # Effective per-round quantum: at most mean item size so that a single
+        # round serves ~1 item per unit weight (proper DRR proportionality).
+        # When items are uniform this gives weight=2 → 2 items per round.
         if items:
             mean_size = max(it.nbytes for it in items)
-            effective_quantum = max(self.quantum, mean_size)
+            effective_quantum = mean_size
         else:
             effective_quantum = self.quantum
         local_buckets: dict[int, TokenBucket] = {}
@@ -402,20 +401,97 @@ class TenantScheduler:
         # dry we skip that tenant for this round and serve the next instead.
         # That keeps the order deterministic and graph-replay safe.
         cursor = [0]  # mutable round-robin cursor for DRR
-        guard = 4 * sum(len(q) for q in local_queues.values()) + 8
+        # Proper DRR: each round visits each tenant in order, adds credit,
+        # and drains while it has enough — so weight=W serves W items per
+        # round (long-term throughput share matches weight ratio).
+        guard = 8 * sum(len(q) for q in local_queues.values()) + 16
         while any(local_queues.values()) and guard > 0:
             guard -= 1
-            picked = self._plan_pick_one(local_queues, local_deficits,
-                                         local_buckets, effective_quantum,
-                                         cursor)
-            if picked is None:
+            served_this_round = self._plan_drain_one_round(
+                local_queues, local_deficits, local_buckets,
+                effective_quantum, order, cursor)
+            if not served_this_round:
                 # All non-empty queues are bucket-blocked; force-pop the
-                # smallest head to make progress.
+                # smallest head to make progress and avoid infinite loop.
                 tid = min((t for t, q in local_queues.items() if q),
                           key=lambda t: local_queues[t][0].nbytes)
-                picked = local_queues[tid].popleft()
-            order.append(picked)
+                order.append(local_queues[tid].popleft())
         return order
+
+    def _plan_drain_one_round(self, queues, deficits, buckets, quantum,
+                              order, cursor):
+        """One DRR round: visit each tenant, add weight*quantum credit, drain
+        while items fit. Returns True if any item served."""
+        served_any = False
+        ordered_tids = sorted(queues.keys())
+        if not ordered_tids:
+            return False
+        n = len(ordered_tids)
+        if self.mode == PolicyMode.STRICT_PRIORITY:
+            # Strict priority: serve only the highest-priority non-empty tenant
+            best_tid = None
+            best_pri = -1
+            for tid, q in queues.items():
+                if not q:
+                    continue
+                ctx = self.policy.tenants.get(tid)
+                pri = int(ctx.qos_class) if ctx else 0
+                if pri > best_pri:
+                    best_pri = pri
+                    best_tid = tid
+            if best_tid is None:
+                return False
+            head = queues[best_tid][0]
+            b = buckets.get(best_tid)
+            if b is None or b.refill_bps == 0 or b.tokens >= head.nbytes:
+                if b is not None and b.refill_bps != 0:
+                    b.tokens -= head.nbytes
+                order.append(queues[best_tid].popleft())
+                served_any = True
+            return served_any
+
+        if self.mode == PolicyMode.HYBRID:
+            # Premium first (one item), then DRR for the rest
+            for tid, q in queues.items():
+                if not q:
+                    continue
+                ctx = self.policy.tenants.get(tid)
+                if ctx and ctx.qos_class >= QoSClass.PREMIUM:
+                    head = q[0]
+                    b = buckets.get(tid)
+                    if b is None or b.refill_bps == 0 or b.tokens >= head.nbytes:
+                        if b is not None and b.refill_bps != 0:
+                            b.tokens -= head.nbytes
+                        order.append(q.popleft())
+                        served_any = True
+                        return served_any  # one premium then back to top
+            # fall through to DRR
+
+        # DRR: each tenant in turn, drain while it can
+        for step in range(n):
+            idx = (cursor[0] + step) % n
+            tid = ordered_tids[idx]
+            q = queues.get(tid)
+            if not q:
+                continue
+            ctx = self.policy.tenants.get(tid)
+            weight = ctx.weight if ctx else 1
+            deficits[tid] = deficits.get(tid, 0) + max(weight, 1) * quantum
+            while q:
+                head = q[0]
+                if head.nbytes > deficits[tid]:
+                    break
+                b = buckets.get(tid)
+                if b is not None and b.refill_bps != 0 and b.tokens < head.nbytes:
+                    break  # bucket dry, skip rest this round
+                deficits[tid] -= head.nbytes
+                if b is not None and b.refill_bps != 0:
+                    b.tokens -= head.nbytes
+                order.append(q.popleft())
+                served_any = True
+        # Advance cursor so next round starts at next tenant
+        cursor[0] = (cursor[0] + 1) % n
+        return served_any
 
     def _plan_pick_one(self,
                        queues: dict[int, deque],
@@ -530,10 +606,62 @@ def build_policy(mode: PolicyMode, tenants: list[dict]) -> PolicyTable:
     return table
 
 
+# ---------------------------------------------------------------------------
+# Iter 3: Python wrapper for the C++ TenantAwareProxyService
+# (mscclpp::ext::tenant::TenantAwareProxyService).
+# Drop-in replacement for mscclpp.ProxyService that performs tenant-aware
+# trigger scheduling INSIDE the proxy thread (no Python round-trip per kernel).
+# ---------------------------------------------------------------------------
+
+def _cpp_qos(qos: QoSClass):
+    from mscclpp._mscclpp import CppQoSClass
+    return {
+        QoSClass.BEST_EFFORT: CppQoSClass.BestEffort,
+        QoSClass.STANDARD:    CppQoSClass.Standard,
+        QoSClass.PREMIUM:     CppQoSClass.Premium,
+        QoSClass.REALTIME:    CppQoSClass.Realtime,
+    }[qos]
+
+
+def _cpp_mode(mode: PolicyMode):
+    from mscclpp._mscclpp import CppPolicyMode
+    return {
+        PolicyMode.SINGLE_PASSTHROUGH: CppPolicyMode.SinglePassthrough,
+        PolicyMode.FAIR:               CppPolicyMode.Fair,
+        PolicyMode.STRICT_PRIORITY:    CppPolicyMode.StrictPriority,
+        PolicyMode.HYBRID:             CppPolicyMode.Hybrid,
+    }[mode]
+
+
+def TenantAwareProxyService(mode: PolicyMode = PolicyMode.SINGLE_PASSTHROUGH,
+                            fifo_size: int = 128):
+    """Construct a C++ TenantAwareProxyService — drop-in replacement for
+    mscclpp.ProxyService with per-tenant scheduling.
+
+    Returns the raw CppTenantAwareProxyService object so it can be passed
+    anywhere a CppProxyService is expected (e.g. CommGroup.make_port_channels).
+    """
+    from mscclpp._mscclpp import CppTenantAwareProxyService
+    svc = CppTenantAwareProxyService(_cpp_mode(mode), fifo_size)
+    return svc
+
+
+def register_tenant_on(svc, tenant_id: int,
+                       qos: QoSClass = QoSClass.STANDARD,
+                       weight: int = 1,
+                       bandwidth_max_bps: int = 0,
+                       burst_bytes: int = 0) -> None:
+    """Convenience: register a tenant on a CppTenantAwareProxyService."""
+    svc.register_tenant(tenant_id, _cpp_qos(qos), weight,
+                        int(bandwidth_max_bps), int(burst_bytes))
+
+
 __all__ = [
     "MAX_TENANTS", "DEFAULT_TENANT",
     "QoSClass", "PolicyMode",
     "TenantContext", "BandwidthBudget", "PolicyTable",
     "TokenBucket", "TenantScheduler", "WorkItem",
     "publish_policy", "load_policy", "build_policy",
+    # Iter 3: C++ TenantAwareProxyService wrapper
+    "TenantAwareProxyService", "register_tenant_on",
 ]

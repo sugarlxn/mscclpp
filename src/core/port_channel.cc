@@ -86,6 +86,14 @@ MSCCLPP_API_CPP PortChannel ProxyService::portChannel(SemaphoreId id, MemoryId d
   return PortChannel(id, semaphores_[id], proxy_, dst, src);
 }
 
+MSCCLPP_API_CPP void ProxyService::setHandlerDecorator(ProxyHandlerDecorator decorator) {
+  if (!decorator) return;
+  // The inner handler is our own handleTrigger; wrap it and hot-swap the
+  // proxy thread's handler before the thread starts.
+  ProxyHandler inner = [this](ProxyTrigger triggerRaw) { return handleTrigger(triggerRaw); };
+  proxy_->pimpl_->handler = decorator(std::move(inner));
+}
+
 MSCCLPP_API_CPP void ProxyService::startProxy(bool blocking) { proxy_->start(blocking); }
 
 MSCCLPP_API_CPP void ProxyService::stopProxy() {
