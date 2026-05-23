@@ -353,27 +353,21 @@ def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
             for idx, it in enumerate(order):
                 last_idx_for[it.tenant_id] = idx
 
-            # CUDA graph capture: launch one algo per item in scheduler order.
+            # Launch each item in the scheduler-decided order using CUDA events
+            # to time per-tenant span. We skip CUDA graph capture here because
+            # MSCCL++ collectives that use the host proxy issue FIFO triggers
+            # that don't fit a captured stream model cleanly; the savings come
+            # from plan-time scheduling (no runtime scheduler thread) rather
+            # than from per-call graph-launch amortization. (See iter 2 note.)
             stream = cp.cuda.Stream(non_blocking=True)
             start_event = cp.cuda.Event()
             end_events = {tid: cp.cuda.Event() for tid in range(1, num_tenants + 1)}
-            with stream:
-                stream.begin_capture()
-                start_event.record(stream)
-                for idx, it in enumerate(order):
-                    algo(stream)
-                    if idx == last_idx_for.get(it.tenant_id):
-                        end_events[it.tenant_id].record(stream)
-                graph = stream.end_capture()
-
-            # warmup graph launch
-            graph.launch(stream)
+            start_event.record(stream)
+            for idx, it in enumerate(order):
+                algo(stream)
+                if idx == last_idx_for.get(it.tenant_id):
+                    end_events[it.tenant_id].record(stream)
             stream.synchronize()
-
-            # measured launch
-            graph.launch(stream)
-            stream.synchronize()
-
             comm.barrier()
 
             if rank == 0:
