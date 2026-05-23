@@ -35,13 +35,16 @@ void register_port_channel(nb::module_& m) {
       .def(nb::init<>())
       .def(nb::init<SemaphoreId, std::shared_ptr<Host2DeviceSemaphore>, std::shared_ptr<Proxy>>(),
            nb::arg("semaphore_id"), nb::arg("semaphore"), nb::arg("proxy"))
-      .def("device_handle", &BasePortChannel::deviceHandle);
+      .def("device_handle", &BasePortChannel::deviceHandle)
+      .def("set_tenant_id", &BasePortChannel::setTenantId, nb::arg("tenant_id"))
+      .def("tenant_id", &BasePortChannel::tenantId);
 
   nb::class_<BasePortChannel::DeviceHandle>(m, "CppBasePortChannelDeviceHandle")
       .def(nb::init<>())
       .def_rw("semaphore_id_", &BasePortChannel::DeviceHandle::semaphoreId_)
       .def_rw("semaphore_", &BasePortChannel::DeviceHandle::semaphore_)
       .def_rw("fifo_", &BasePortChannel::DeviceHandle::fifo_)
+      .def_rw("tenant_id_", &BasePortChannel::DeviceHandle::tenantId_)
       .def_prop_ro("raw", [](const BasePortChannel::DeviceHandle& self) -> nb::bytes {
         return nb::bytes(reinterpret_cast<const char*>(&self), sizeof(self));
       });
@@ -50,7 +53,9 @@ void register_port_channel(nb::module_& m) {
       .def(nb::init<>())
       .def(nb::init<SemaphoreId, std::shared_ptr<Host2DeviceSemaphore>, std::shared_ptr<Proxy>, MemoryId, MemoryId>(),
            nb::arg("semaphore_id"), nb::arg("semaphore"), nb::arg("proxy"), nb::arg("dst"), nb::arg("src"))
-      .def("device_handle", &PortChannel::deviceHandle);
+      .def("device_handle", &PortChannel::deviceHandle)
+      .def("set_tenant_id", [](PortChannel& self, uint32_t tid) { self.setTenantId(tid); }, nb::arg("tenant_id"))
+      .def("tenant_id", [](const PortChannel& self) { return self.tenantId(); });
 
   nb::class_<PortChannel::DeviceHandle>(m, "CppPortChannelDeviceHandle")
       .def(nb::init<>())
@@ -59,6 +64,7 @@ void register_port_channel(nb::module_& m) {
       .def_rw("fifo_", &PortChannel::DeviceHandle::fifo_)
       .def_rw("src_", &PortChannel::DeviceHandle::src_)
       .def_rw("dst_", &PortChannel::DeviceHandle::dst_)
+      .def_rw("tenant_id_", &PortChannel::DeviceHandle::tenantId_)
       .def_prop_ro("raw", [](const PortChannel::DeviceHandle& self) -> nb::bytes {
         return nb::bytes(reinterpret_cast<const char*>(&self), sizeof(self));
       });

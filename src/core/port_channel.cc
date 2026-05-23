@@ -154,13 +154,13 @@ ProxyHandlerResult ProxyService::handleTrigger(ProxyTrigger trigger) {
 MSCCLPP_API_CPP BasePortChannel::DeviceHandle BasePortChannel::deviceHandle() const {
   auto& conn = semaphore_->connection();
   return BasePortChannel::DeviceHandle(semaphoreId_, semaphore_->deviceHandle(), proxy_->fifo()->deviceHandle(),
-                                       conn.impl_->getFlushDonePtr());
+                                       conn.impl_->getFlushDonePtr(), tenantId_);
 }
 
 MSCCLPP_API_CPP PortChannel::DeviceHandle PortChannel::deviceHandle() const {
   auto& conn = semaphore_->connection();
   return PortChannel::DeviceHandle(semaphoreId_, semaphore_->deviceHandle(), proxy_->fifo()->deviceHandle(), dst_, src_,
-                                   conn.impl_->getFlushDonePtr());
+                                   conn.impl_->getFlushDonePtr(), tenantId_);
 }
 
 void ProxyService::progressFlushes() {

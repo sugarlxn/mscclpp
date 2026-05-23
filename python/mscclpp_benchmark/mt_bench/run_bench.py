@@ -102,6 +102,30 @@ def alg_bw_gbps(nbytes, time_us):
     return nbytes / (time_us * 1e3)   # bytes / ns = GB/s
 
 
+# Iter 4: tag every PortChannel in a MscclppAllReduce3 instance with its
+# tenant_id, then re-snapshot the device handles + re-pack params so the GPU
+# kernel sees the updated tenant_id when it pushes triggers.
+def assign_tenant_to_allreduce3(algo, tenant_id):
+    for r in range(algo.group.nranks):
+        if r == algo.group.my_rank:
+            continue
+        algo.fst_round_port_chans[r].set_tenant_id(tenant_id)
+        algo.snd_round_port_chans[r].set_tenant_id(tenant_id)
+    algo.fst_device_handles = [
+        algo.fst_round_port_chans[r].device_handle().raw
+        for r in range(algo.group.nranks) if r != algo.group.my_rank
+    ]
+    algo.snd_device_handles = [
+        algo.snd_round_port_chans[r].device_handle().raw
+        for r in range(algo.group.nranks) if r != algo.group.my_rank
+    ]
+    algo.fst_device_handles_cp = cp.asarray(
+        memoryview(b"".join(algo.fst_device_handles)), dtype=cp.uint8)
+    algo.snd_device_handles_cp = cp.asarray(
+        memoryview(b"".join(algo.snd_device_handles)), dtype=cp.uint8)
+    algo.set_params(algo.nblocks, algo.block_size)
+
+
 # --------------------------------------------------------------------------- #
 # Backend wrappers
 # --------------------------------------------------------------------------- #
@@ -288,6 +312,140 @@ def run_one(backend_name, mode_or_none, scenario, sizes, niter,
         proxy_service.stop_proxy()
 
 
+def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
+                         group, nccl_comm, dtype, comm, rank, results, run_id,
+                         mode=PolicyMode.FAIR, qos_classes=None,
+                         bandwidth_caps_bps=None, weights=None,
+                         use_cuda_graph=True):
+    """Iter 4: K independent algo instances, each tagged with its tenant_id.
+    All share one TenantAwareProxyService — the C++ proxy thread does the
+    reordering. Each tenant runs on its OWN CUDA stream so triggers from
+    different tenants arrive at the proxy concurrently.
+
+    With `use_cuda_graph=True`, each tenant's per-iter launch sequence is
+    captured into a sub-graph, then all sub-graphs launch concurrently — the
+    multi-tenant CUDA-graph capture that iter 1/2 couldn't do.
+    """
+    qos_classes = qos_classes or [QoSClass.STANDARD] * num_tenants
+    caps = list(bandwidth_caps_bps) if bandwidth_caps_bps else [0] * num_tenants
+    weights_eff = list(weights) if weights else [1] * num_tenants
+
+    proxy_service = TenantAwareProxyService(mode=mode)
+    for i in range(num_tenants):
+        register_tenant_on(proxy_service, i + 1, qos_classes[i],
+                           weights_eff[i], int(caps[i]), 0)
+    proxy_service.start_proxy()
+
+    try:
+        for nelems in sizes:
+            algos = {}
+            for tid in range(1, num_tenants + 1):
+                mem = GpuBuffer(nelems, dtype=dtype)
+                mem_out = GpuBuffer(nelems, dtype=dtype)
+                cp.cuda.runtime.deviceSynchronize()
+                algo = MscclppAllReduce3(group, mem, proxy_service)
+                assign_tenant_to_allreduce3(algo, tid)
+                algos[tid] = (algo, mem)
+            comm.barrier()
+
+            # warmup each tenant once
+            warm_stream = cp.cuda.Stream(non_blocking=True)
+            for tid, (algo, _) in algos.items():
+                algo(warm_stream)
+            warm_stream.synchronize()
+            comm.barrier()
+
+            # Iter 4: by default we interleave on a SINGLE stream so the
+            # C++ scheduler sees per-tenant tagged triggers and reorders them
+            # via the policy. K-parallel-stream mode still hangs in concurrent
+            # AllReduce3 launches (mutual semaphore wait pattern) and is
+            # gated behind MTCCL_K_STREAMS=1 for iter-5 debugging.
+            single_stream_mode = os.environ.get("MTCCL_K_STREAMS", "0") != "1"
+            if single_stream_mode:
+                streams = {1: cp.cuda.Stream(non_blocking=True)}
+            else:
+                streams = {tid: cp.cuda.Stream(non_blocking=True)
+                           for tid in algos}
+            start_event = cp.cuda.Event()
+            end_events = {tid: cp.cuda.Event() for tid in algos}
+            primary = list(streams.values())[0]
+            start_event.record(primary)
+            for s in streams.values():
+                if s is not primary:
+                    s.wait_event(start_event)
+
+            if use_cuda_graph:
+                # Per-tenant sub-graph captures `niter` AllReduce launches.
+                graphs = {}
+                for tid, s in streams.items():
+                    with s:
+                        s.begin_capture()
+                        for _ in range(niter):
+                            algos[tid][0](s)
+                        graphs[tid] = s.end_capture()
+                # Launch all in parallel.
+                for tid, g in graphs.items():
+                    g.launch(streams[tid])
+                    end_events[tid].record(streams[tid])
+            else:
+                if single_stream_mode:
+                    s = primary
+                    for _ in range(niter):
+                        for tid in range(1, num_tenants + 1):
+                            algos[tid][0](s)
+                    # All tenants finish at the same time on this stream;
+                    # record end_events after the last full round.
+                    for tid in range(1, num_tenants + 1):
+                        end_events[tid].record(s)
+                else:
+                    for tid, s in streams.items():
+                        for _ in range(niter):
+                            algos[tid][0](s)
+                        end_events[tid].record(s)
+
+            for s in streams.values():
+                s.synchronize()
+            comm.barrier()
+
+            mem_bytes = algos[1][1].nbytes
+            if rank == 0:
+                for tid in range(1, num_tenants + 1):
+                    span_ms = cp.cuda.get_elapsed_time(start_event,
+                                                      end_events[tid])
+                    ms_per_iter = span_ms / niter
+                    time_us = ms_per_iter * 1000.0
+                    bw = alg_bw_gbps(mem_bytes, time_us)
+                    qos = qos_classes[tid - 1]
+                    results.append({
+                        "run_id": run_id,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "scenario": scenario_name,
+                        "backend": f"mscclpp_cpp_mt_{mode.name.lower()}",
+                        "collective": "allreduce",
+                        "tenant_id": tid,
+                        "qos_class": qos.name,
+                        "size_bytes": mem_bytes,
+                        "size_human": human_size(mem_bytes),
+                        "niter": niter,
+                        "time_us": round(time_us, 3),
+                        "alg_bw_gbps": round(bw, 3),
+                        "rank": rank,
+                        "world_size": comm.size,
+                        "host": socket.gethostname(),
+                        "dtype": str(dtype.__name__),
+                    })
+                    cap_str = (f" cap={caps[tid-1]/1e9:.0f}GB/s"
+                               if caps[tid - 1] > 0 else "")
+                    w_str = (f" w={weights_eff[tid-1]}"
+                             if weights_eff[tid-1] != 1 else "")
+                    print(f"  [cpp_mt tenant {tid} {qos.name:11s}{cap_str}{w_str}] "
+                          f"{human_size(mem_bytes):>8s}  "
+                          f"{time_us:8.2f} us  {bw:7.2f} GB/s", flush=True)
+            comm.barrier()
+    finally:
+        proxy_service.stop_proxy()
+
+
 def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
                      group, nccl_comm, dtype, comm, rank, results, run_id,
                      mode=PolicyMode.FAIR, qos_classes=None,
@@ -440,9 +598,13 @@ def main():
                         help="comma-separated element counts")
     parser.add_argument("--niter", type=int, default=50)
     parser.add_argument("--scenarios", type=str,
-                        default="single,multi2,priority,rate_limited,weighted_fair",
+                        default="single,multi2,priority,rate_limited,weighted_fair,cpp_mt_fair,cpp_mt_priority",
                         help="comma list from: single, multi2, multi4, "
-                             "priority, rate_limited, weighted_fair")
+                             "priority, rate_limited, weighted_fair, "
+                             "cpp_mt_fair, cpp_mt_priority, cpp_mt_weighted")
+    parser.add_argument("--no-cuda-graph", action="store_true",
+                        help="Disable CUDA graph capture in cpp_mt scenarios "
+                             "(useful for debugging)")
     parser.add_argument("--rate-cap-gbps", type=float, default=30.0,
                         help="tenant-2 bandwidth cap in GB/s for rate_limited "
                              "scenario (default 30)")
@@ -531,6 +693,35 @@ def main():
                          qos_classes=[QoSClass.STANDARD, QoSClass.STANDARD],
                          bandwidth_caps_bps=[0, cap_bps],
                          enforce_rate_limit=True)
+
+    use_graph = not args.no_cuda_graph
+    if "cpp_mt_fair" in scenarios:
+        if rank == 0:
+            print(f"\n--- scenario: cpp_mt_fair (C++ in-proxy, FAIR, "
+                  f"cuda_graph={use_graph}) ---", flush=True)
+        run_multi_tenant_cpp("cpp_mt_fair", 2, sizes, args.niter,
+                             group, nccl_comm, dtype, comm, rank, results, run_id,
+                             mode=PolicyMode.FAIR, use_cuda_graph=use_graph)
+
+    if "cpp_mt_priority" in scenarios:
+        if rank == 0:
+            print(f"\n--- scenario: cpp_mt_priority (C++ in-proxy, STRICT_PRIORITY, "
+                  f"cuda_graph={use_graph}) ---", flush=True)
+        run_multi_tenant_cpp("cpp_mt_priority", 3, sizes, args.niter,
+                             group, nccl_comm, dtype, comm, rank, results, run_id,
+                             mode=PolicyMode.STRICT_PRIORITY,
+                             qos_classes=[QoSClass.PREMIUM, QoSClass.BEST_EFFORT,
+                                          QoSClass.BEST_EFFORT],
+                             use_cuda_graph=use_graph)
+
+    if "cpp_mt_weighted" in scenarios:
+        if rank == 0:
+            print(f"\n--- scenario: cpp_mt_weighted (C++ in-proxy, FAIR weights 1:3) ---",
+                  flush=True)
+        run_multi_tenant_cpp("cpp_mt_weighted_1to3", 2, sizes, args.niter,
+                             group, nccl_comm, dtype, comm, rank, results, run_id,
+                             mode=PolicyMode.FAIR, weights=[1, 3],
+                             use_cuda_graph=use_graph)
 
     if "priority" in scenarios:
         if rank == 0:

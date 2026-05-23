@@ -119,6 +119,11 @@ struct BasePortChannel {
 
   std::shared_ptr<Proxy> proxy_;
 
+  // MT-MSCCL++ (design.md §5.2): tenant_id propagated into the device handle
+  // and ultimately into every ProxyTrigger pushed from this channel. The
+  // host-side default of 0 maps to mscclpp::ext::tenant::DEFAULT_TENANT.
+  uint32_t tenantId_ = 0;
+
  public:
   /// Constructor.
   BasePortChannel() = default;
@@ -143,6 +148,12 @@ struct BasePortChannel {
   /// Assignment operator.
   /// @param other The other BasePortChannel to assign from.
   BasePortChannel& operator=(BasePortChannel& other) = default;
+
+  /// MT-MSCCL++: set the tenant_id carried by every trigger this channel
+  /// pushes. Must be called BEFORE deviceHandle() is captured by the caller
+  /// (the GPU-side handle is a value snapshot).
+  void setTenantId(uint32_t tenantId) { tenantId_ = tenantId; }
+  uint32_t tenantId() const { return tenantId_; }
 
   /// Device-side handle for BasePortChannel.
   using DeviceHandle = BasePortChannelDeviceHandle;

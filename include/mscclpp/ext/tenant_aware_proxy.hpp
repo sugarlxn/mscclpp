@@ -141,15 +141,19 @@ class TenantAwareProxyHandler {
 
   /// Direct invocation. Fast-paths the single-tenant case (design.md §5.5).
   ProxyHandlerResult operator()(ProxyTrigger trig) {
+    if (!inner_) {
+      // Misconfigured: setHandlerDecorator must wire inner_ before triggers flow.
+      fprintf(stderr, "[mt-mscclpp] FATAL: TenantAwareProxyHandler inner_ is empty\n");
+      return ProxyHandlerResult::Stop;
+    }
     uint32_t mask = activeMask_.load(std::memory_order_acquire);
-    // Single-tenant bypass: zero scheduling overhead.
+    // Single-tenant bypass: zero scheduling overhead (design.md §5.5).
     if (__builtin_popcount(mask) <= 1) {
       return inner_(trig);
     }
 
     uint32_t tid = static_cast<uint32_t>(trig.fields.tenantId);
     if (tid >= MAX_TENANTS) tid = 0;
-
     {
       std::lock_guard<std::mutex> g(mu_);
       queues_[tid].push_back(trig);
@@ -159,41 +163,30 @@ class TenantAwareProxyHandler {
 
  private:
   ProxyHandlerResult drain() {
-    ProxyHandlerResult last = ProxyHandlerResult::Continue;
-    for (;;) {
-      ProxyTrigger picked{};
-      uint32_t pickedTid = MAX_TENANTS;
-      bool found = false;
-      {
-        std::lock_guard<std::mutex> g(mu_);
-        pickedTid = pickNext();
-        if (pickedTid >= MAX_TENANTS) return last;
-        // Honor token bucket without holding the queue lock.
-        auto& q = queues_[pickedTid];
-        if (q.empty()) return last;
-        picked = q.front();
-        // Rate-limit check (uses bucket's own internal lock).
-        found = true;
+    // The proxy thread is single-threaded; operator() is called once per
+    // trigger and immediately drains. We process AT MOST one trigger here
+    // and release the queue lock before invoking inner_, which keeps the
+    // mutex hold time bounded (inner_ may block on conn.flush()).
+    ProxyTrigger picked{};
+    uint32_t pickedTid = MAX_TENANTS;
+    uint64_t size = 0;
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      pickedTid = pickNext();
+      if (pickedTid >= MAX_TENANTS) return ProxyHandlerResult::Continue;
+      auto& q = queues_[pickedTid];
+      if (q.empty()) return ProxyHandlerResult::Continue;
+      picked = q.front();
+      size = static_cast<uint64_t>(picked.fst & ((uint64_t{1} << TriggerBitsSize) - 1));
+      // Rate limit check (bucket has its own internal mutex; cheap).
+      if (!buckets_[pickedTid].tryConsume(size == 0 ? 1 : size)) {
+        // Bucket dry — keep trigger queued; we'll retry on next operator() call.
+        return ProxyHandlerResult::Continue;
       }
-      if (!found) return last;
-
-      uint64_t bytes = static_cast<uint64_t>(picked.fields.dstOffset == 0 ? 0 : 0) + picked.fields.dstOffset;
-      // Re-extract size from fst (low 32 bits hold `size`).
-      uint64_t size = static_cast<uint64_t>(picked.fst & ((uint64_t{1} << TriggerBitsSize) - 1));
-      if (buckets_[pickedTid].tryConsume(size == 0 ? 1 : size)) {
-        std::lock_guard<std::mutex> g(mu_);
-        if (!queues_[pickedTid].empty()) {
-          queues_[pickedTid].pop_front();
-        }
-        last = inner_(picked);
-        if (last == ProxyHandlerResult::Stop) return last;
-      } else {
-        // Bucket dry — yield; the proxy will be called again with future
-        // triggers and we'll retry the head of this queue then.
-        return last;
-      }
-      (void)bytes;
+      q.pop_front();
     }
+    // Outside the queue lock: process the trigger.
+    return inner_(picked);
   }
 
   // Caller must hold mu_.
