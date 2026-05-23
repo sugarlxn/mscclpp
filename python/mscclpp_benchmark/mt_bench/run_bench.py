@@ -289,11 +289,21 @@ def run_one(backend_name, mode_or_none, scenario, sizes, niter,
 
 def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
                      group, nccl_comm, dtype, comm, rank, results, run_id,
-                     mode=PolicyMode.FAIR, qos_classes=None):
+                     mode=PolicyMode.FAIR, qos_classes=None,
+                     bandwidth_caps_bps=None,
+                     enforce_rate_limit=False):
     """Emulate K tenants sharing the same comm by interleaving their AllReduce.
 
-    All K tenants run the SAME backend (MSCCL++ vanilla), but the scheduler
-    arbitrates the interleaving. We measure per-tenant aggregate time.
+    Iter 2 design (design.md §5.3, §6.3):
+      1. Build N=niter*K WorkItems, run scheduler.plan_order(...) to get the
+         tenant-aware launch order WITHOUT touching CUDA.
+      2. Capture the entire ordered launch in a CUDA graph (one kernel per item).
+      3. Insert a CUDA Event after each tenant's last item in the order, so we
+         can measure per-tenant span as event(start → last_for_tenant).
+      4. Launch the graph; measure all events with one synchronize.
+
+    This fixes iter1 limitation #1 (no CUDA graphs in MT path) by separating
+    "what to schedule" (CPU, ahead of time) from "when to launch" (GPU graph).
     """
     proxy_service = ProxyService()
     proxy_service.start_proxy()
@@ -305,55 +315,75 @@ def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
             algo = MscclppVanillaBackend._select_algo(
                 group, memory, memory_out, proxy_service)
 
-            tenant_specs = []
             qos_classes = qos_classes or [QoSClass.STANDARD] * num_tenants
+            caps = list(bandwidth_caps_bps) if bandwidth_caps_bps \
+                   else [0] * num_tenants
+
+            tenant_specs = []
             for tid in range(1, num_tenants + 1):
                 tenant_specs.append({
                     "tenant_id": tid,
                     "qos_class": int(qos_classes[tid - 1]),
-                    "weight": 100 if qos_classes[tid - 1] == QoSClass.STANDARD else 200,
+                    "weight": 100 if qos_classes[tid - 1] == QoSClass.STANDARD
+                              else 200,
+                    "bandwidth_max_bps": int(caps[tid - 1]),
                 })
             table = build_policy(mode, tenant_specs)
-            sched = TenantScheduler(table, mode=mode, enforce_rate_limit=False)
-            sched.start()
+            sched = TenantScheduler(table, mode=mode,
+                                    enforce_rate_limit=enforce_rate_limit)
             comm.barrier()
 
-            # warmup
-            stream = cp.cuda.Stream(non_blocking=True)
-            algo(stream)
-            stream.synchronize()
+            # warmup once outside the graph
+            warm_stream = cp.cuda.Stream(non_blocking=True)
+            algo(warm_stream)
+            warm_stream.synchronize()
             comm.barrier()
 
-            # Submit niter work items per tenant, interleaved.
-            per_tenant_done = {tid: 0 for tid in range(1, num_tenants + 1)}
-            per_tenant_start = {tid: time.perf_counter_ns() for tid in per_tenant_done}
-            per_tenant_end = {tid: 0 for tid in per_tenant_done}
-
-            def make_cb(tid):
-                def cb():
-                    algo(stream)
-                    stream.synchronize()
-                    per_tenant_done[tid] += 1
-                    if per_tenant_done[tid] == niter:
-                        per_tenant_end[tid] = time.perf_counter_ns()
-                return cb
-
-            total_submit_start = time.perf_counter_ns()
+            # Build niter items per tenant; plan_order interleaves per policy.
+            now = time.time_ns()
+            items = []
             for i in range(niter):
                 for tid in range(1, num_tenants + 1):
-                    sched.submit(WorkItem(
-                        tenant_id=tid, nbytes=memory.nbytes,
-                        enqueue_ts_ns=time.time_ns(),
-                        callback=make_cb(tid),
-                    ))
-            sched.wait_idle(timeout=60.0)
-            sched.stop()
+                    items.append(WorkItem(tenant_id=tid, nbytes=memory.nbytes,
+                                          enqueue_ts_ns=now, callback=None))
+            order = sched.plan_order(items)
+
+            # Determine the index in `order` of each tenant's last item.
+            last_idx_for = {}
+            for idx, it in enumerate(order):
+                last_idx_for[it.tenant_id] = idx
+
+            # CUDA graph capture: launch one algo per item in scheduler order.
+            stream = cp.cuda.Stream(non_blocking=True)
+            start_event = cp.cuda.Event()
+            end_events = {tid: cp.cuda.Event() for tid in range(1, num_tenants + 1)}
+            with stream:
+                stream.begin_capture()
+                start_event.record(stream)
+                for idx, it in enumerate(order):
+                    algo(stream)
+                    if idx == last_idx_for.get(it.tenant_id):
+                        end_events[it.tenant_id].record(stream)
+                graph = stream.end_capture()
+
+            # warmup graph launch
+            graph.launch(stream)
+            stream.synchronize()
+
+            # measured launch
+            graph.launch(stream)
+            stream.synchronize()
+
             comm.barrier()
 
             if rank == 0:
+                total_calls_per_tenant = {tid: 0 for tid in range(1, num_tenants + 1)}
+                for it in order:
+                    total_calls_per_tenant[it.tenant_id] += 1
                 for tid in range(1, num_tenants + 1):
-                    elapsed_ns = per_tenant_end[tid] - per_tenant_start[tid]
-                    ms_per_iter = (elapsed_ns / niter) / 1e6
+                    span_ms = cp.cuda.get_elapsed_time(start_event, end_events[tid])
+                    iters = total_calls_per_tenant[tid] or 1
+                    ms_per_iter = span_ms / iters
                     time_us = ms_per_iter * 1000.0
                     bw = alg_bw_gbps(memory.nbytes, time_us)
                     qos = qos_classes[tid - 1]
@@ -375,7 +405,10 @@ def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
                         "host": socket.gethostname(),
                         "dtype": str(dtype.__name__),
                     })
-                    print(f"  [tenant {tid} qos={qos.name:10s}] {human_size(memory.nbytes):>8s}  "
+                    cap_str = (f" (cap {caps[tid-1]/1e9:.1f} GB/s)"
+                               if caps[tid - 1] > 0 else "")
+                    print(f"  [tenant {tid} qos={qos.name:10s}{cap_str}] "
+                          f"{human_size(memory.nbytes):>8s}  "
                           f"{time_us:8.2f} us  {bw:7.2f} GB/s", flush=True)
             comm.barrier()
     finally:
@@ -393,8 +426,12 @@ def main():
                         help="comma-separated element counts")
     parser.add_argument("--niter", type=int, default=50)
     parser.add_argument("--scenarios", type=str,
-                        default="single,multi2,priority",
-                        help="comma list from: single, multi2, multi4, priority")
+                        default="single,multi2,priority,rate_limited",
+                        help="comma list from: single, multi2, multi4, "
+                             "priority, rate_limited")
+    parser.add_argument("--rate-cap-gbps", type=float, default=30.0,
+                        help="tenant-2 bandwidth cap in GB/s for rate_limited "
+                             "scenario (default 30)")
     parser.add_argument("--out", type=str, default="/root/ccl/results/mt_bench.csv")
     parser.add_argument("--dtype", type=str, default="fp32",
                         choices=["fp16", "fp32"])
@@ -457,6 +494,19 @@ def main():
         run_multi_tenant("multi_tenant_4x_fair", 4, sizes, args.niter,
                          group, nccl_comm, dtype, comm, rank, results, run_id,
                          mode=PolicyMode.FAIR)
+
+    if "rate_limited" in scenarios:
+        if rank == 0:
+            print(f"\n--- scenario: rate_limited (tenant 1 unlimited, "
+                  f"tenant 2 capped @ {args.rate_cap_gbps:g} GB/s) ---",
+                  flush=True)
+        cap_bps = int(args.rate_cap_gbps * 1e9)
+        run_multi_tenant("rate_limited", 2, sizes, args.niter,
+                         group, nccl_comm, dtype, comm, rank, results, run_id,
+                         mode=PolicyMode.FAIR,
+                         qos_classes=[QoSClass.STANDARD, QoSClass.STANDARD],
+                         bandwidth_caps_bps=[0, cap_bps],
+                         enforce_rate_limit=True)
 
     if "priority" in scenarios:
         if rank == 0:

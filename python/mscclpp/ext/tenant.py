@@ -358,6 +358,130 @@ class TenantScheduler:
             return self.queues[tid].popleft()
         return self._pick_drr()
 
+    # ----------------------------------------------------------------------
+    # Plan-order API (iter 2): decide execution order WITHOUT running kernels.
+    # The caller can then launch the kernels in the SAME thread that captures
+    # the CUDA graph -- fixes iter1 limitation #1 (no graph capture in MT path).
+    # ----------------------------------------------------------------------
+    def plan_order(self, items: list["WorkItem"]) -> list["WorkItem"]:
+        """Return `items` reordered per policy + (virtual) rate limit.
+
+        Pure function: does NOT touch self.queues/deficits/buckets. The
+        scheduling decisions are simulated on a fresh local state so that
+        callers can use this to pre-compute a CUDA-graph friendly launch order.
+        """
+        from copy import copy
+        if self.mode == PolicyMode.SINGLE_PASSTHROUGH:
+            return list(items)
+
+        local_queues: dict[int, deque[WorkItem]] = {}
+        for it in items:
+            local_queues.setdefault(it.tenant_id, deque()).append(it)
+        local_deficits: dict[int, int] = {tid: 0 for tid in local_queues}
+        # Effective per-round quantum: max(self.quantum, mean(item_size)).
+        # This guarantees roughly 1-item-per-round when items are uniform
+        # (typical for AllReduce benchmark), preserving fine-grained
+        # interleaving. Larger weights still get served proportionally more.
+        if items:
+            mean_size = max(it.nbytes for it in items)
+            effective_quantum = max(self.quantum, mean_size)
+        else:
+            effective_quantum = self.quantum
+        local_buckets: dict[int, TokenBucket] = {}
+        if self.enforce_rate_limit:
+            for tid in local_queues:
+                src = self.buckets.get(tid)
+                if src is not None:
+                    b = copy(src)
+                    b.tokens = float(src.burst_bytes)  # fresh fill for the plan
+                    b.last_ts = time.perf_counter_ns()
+                    local_buckets[tid] = b
+
+        order: list[WorkItem] = []
+        # Time-virtual: we charge bucket tokens but never sleep; if a bucket is
+        # dry we skip that tenant for this round and serve the next instead.
+        # That keeps the order deterministic and graph-replay safe.
+        cursor = [0]  # mutable round-robin cursor for DRR
+        guard = 4 * sum(len(q) for q in local_queues.values()) + 8
+        while any(local_queues.values()) and guard > 0:
+            guard -= 1
+            picked = self._plan_pick_one(local_queues, local_deficits,
+                                         local_buckets, effective_quantum,
+                                         cursor)
+            if picked is None:
+                # All non-empty queues are bucket-blocked; force-pop the
+                # smallest head to make progress.
+                tid = min((t for t, q in local_queues.items() if q),
+                          key=lambda t: local_queues[t][0].nbytes)
+                picked = local_queues[tid].popleft()
+            order.append(picked)
+        return order
+
+    def _plan_pick_one(self,
+                       queues: dict[int, deque],
+                       deficits: dict[int, int],
+                       buckets: dict[int, TokenBucket],
+                       quantum: int,
+                       cursor: list[int]) -> Optional[WorkItem]:
+        # Mirror _pick_strict_priority / _pick_drr / _pick_hybrid but on local
+        # state, with virtual bucket charging.
+        def bucket_ok(it: WorkItem) -> bool:
+            b = buckets.get(it.tenant_id)
+            if b is None or b.refill_bps == 0:
+                return True
+            return b.tokens >= it.nbytes
+
+        def charge(it: WorkItem) -> None:
+            b = buckets.get(it.tenant_id)
+            if b is not None and b.refill_bps != 0:
+                b.tokens -= it.nbytes
+
+        candidates = [(tid, q) for tid, q in queues.items() if q]
+        if not candidates:
+            return None
+
+        if self.mode == PolicyMode.STRICT_PRIORITY:
+            candidates.sort(key=lambda p: -int(
+                self.policy.tenants.get(p[0],
+                                        TenantContext(p[0])).qos_class))
+            for tid, q in candidates:
+                if bucket_ok(q[0]):
+                    head = q.popleft()
+                    charge(head)
+                    return head
+            return None
+
+        if self.mode == PolicyMode.HYBRID:
+            for tid, q in candidates:
+                ctx = self.policy.tenants.get(tid)
+                if ctx and ctx.qos_class >= QoSClass.PREMIUM and bucket_ok(q[0]):
+                    head = q.popleft()
+                    charge(head)
+                    return head
+            # fall through to DRR for the rest
+
+        # Deficit Round Robin (Fair / Hybrid-tail) with rotating cursor.
+        ordered_tids = sorted(queues.keys())
+        if not ordered_tids:
+            return None
+        n = len(ordered_tids)
+        for step in range(n):
+            idx = (cursor[0] + step) % n
+            tid = ordered_tids[idx]
+            q = queues.get(tid)
+            if not q:
+                continue
+            ctx = self.policy.tenants.get(tid)
+            weight = ctx.weight if ctx else 1
+            deficits[tid] = deficits.get(tid, 0) + max(weight, 1) * quantum
+            head = q[0]
+            if head.nbytes <= deficits[tid] and bucket_ok(head):
+                deficits[tid] -= head.nbytes
+                charge(head)
+                cursor[0] = (idx + 1) % n
+                return q.popleft()
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Policy table persistence (control-plane → data-plane, design.md §6.2)

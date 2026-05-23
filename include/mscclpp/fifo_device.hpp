@@ -24,8 +24,13 @@ constexpr unsigned int TriggerBitsSize = 32;
 constexpr unsigned int TriggerBitsOffset = 32;
 constexpr unsigned int TriggerBitsMemoryId = 9;
 constexpr unsigned int TriggerBitsType = 3;
-constexpr unsigned int TriggerBitsSemaphoreId = 10;
-constexpr unsigned int TriggerBitsFifoReserved = 1;
+// MT-MSCCL++ (design.md §5.2): borrow 4 bits from semaphoreId and the 1
+// reserved bit to make room for a 5-bit tenant_id. The 6-bit semaphoreId still
+// supports up to 64 semaphores per ProxyService, which is the practical limit
+// (peers × concurrent collectives ≤ 8 × 8 = 64 in a single communicator).
+constexpr unsigned int TriggerBitsSemaphoreId = 6;
+constexpr unsigned int TriggerBitsTenantId = 5;
+constexpr unsigned int TriggerBitsFifoReserved = 0;
 
 /// Pair of 64-bit unsigned integers used as a trigger for the proxy.
 /// Used as a work element in the concurrent FIFO.
@@ -46,10 +51,8 @@ union alignas(16) ProxyTrigger {
     uint64_t srcMemoryId : TriggerBitsMemoryId;
     uint64_t dstMemoryId : TriggerBitsMemoryId;
     uint64_t type : TriggerBitsType;
-    uint64_t semaphoreId : TriggerBitsSemaphoreId;
-    uint64_t : (64 - TriggerBitsOffset - TriggerBitsMemoryId - TriggerBitsMemoryId - TriggerBitsType -
-                TriggerBitsSemaphoreId - TriggerBitsFifoReserved);  // ensure 64-bit alignment
-    uint64_t reserved : TriggerBitsFifoReserved;
+    uint64_t tenantId : TriggerBitsTenantId;        // MT-MSCCL++ tenant_id (5 bits, 0..31)
+    uint64_t semaphoreId : TriggerBitsSemaphoreId;  // shrunk from 10 → 6 bits
   } fields;
 
 #if defined(MSCCLPP_DEVICE_COMPILE)
@@ -63,9 +66,11 @@ union alignas(16) ProxyTrigger {
   /// @param srcId The source ID of memory region.
   /// @param srcOffset The offset into the source memory region.
   /// @param bytes The bytes of the transfer.
-  /// @param semaphoreId The ID of the semaphore.
+  /// @param semaphoreId The ID of the semaphore (0..63 after MT-MSCCL++ bitfield change).
+  /// @param tenantId  MT-MSCCL++ tenant ID (0..31); defaults to 0 for legacy callers.
   MSCCLPP_DEVICE_INLINE ProxyTrigger(TriggerType type, uint32_t dstId, uint64_t dstOffset, uint32_t srcId,
-                                     uint64_t srcOffset, uint64_t bytes, uint32_t semaphoreId) {
+                                     uint64_t srcOffset, uint64_t bytes, uint32_t semaphoreId,
+                                     uint32_t tenantId = 0) {
     MSCCLPP_ASSERT_DEVICE(type < (1ULL << TriggerBitsType), "type is too large");
     MSCCLPP_ASSERT_DEVICE(dstId < (1ULL << TriggerBitsMemoryId), "dstId is too large");
     MSCCLPP_ASSERT_DEVICE(dstOffset < (1ULL << TriggerBitsOffset), "dstOffset is too large");
@@ -74,6 +79,7 @@ union alignas(16) ProxyTrigger {
     MSCCLPP_ASSERT_DEVICE(bytes != 0, "bytes must not be zero");
     MSCCLPP_ASSERT_DEVICE(bytes < (1ULL << TriggerBitsSize), "bytes is too large");
     MSCCLPP_ASSERT_DEVICE(semaphoreId < (1ULL << TriggerBitsSemaphoreId), "semaphoreId is too large");
+    MSCCLPP_ASSERT_DEVICE(tenantId < (1ULL << TriggerBitsTenantId), "tenantId is too large");
     constexpr uint64_t maskSize = (1ULL << TriggerBitsSize) - 1;
     constexpr uint64_t maskSrcOffset = (1ULL << TriggerBitsOffset) - 1;
     constexpr uint64_t maskDstOffset = (1ULL << TriggerBitsOffset) - 1;
@@ -81,8 +87,13 @@ union alignas(16) ProxyTrigger {
     constexpr uint64_t maskDstMemoryId = (1ULL << TriggerBitsMemoryId) - 1;
     constexpr uint64_t maskType = (1ULL << TriggerBitsType) - 1;
     constexpr uint64_t maskSemaphoreId = (1ULL << TriggerBitsSemaphoreId) - 1;
+    constexpr uint64_t maskTenantId = (1ULL << TriggerBitsTenantId) - 1;
     fst = (((srcOffset & maskSrcOffset) << TriggerBitsSize) + (bytes & maskSize));
-    snd = (((((((((semaphoreId & maskSemaphoreId) << TriggerBitsType) + ((uint64_t)type & maskType))
+    // Layout (low → high): dstOffset(32) | srcMemId(9) | dstMemId(9) | type(3) | tenantId(5) | semId(6)
+    snd = (((((((((((semaphoreId & maskSemaphoreId) << TriggerBitsTenantId) +
+                   (tenantId & maskTenantId))
+                  << TriggerBitsType) +
+                 ((uint64_t)type & maskType))
                 << TriggerBitsMemoryId) +
                (dstId & maskDstMemoryId))
               << TriggerBitsMemoryId) +

@@ -43,12 +43,23 @@ struct BasePortChannelDeviceHandle {
   // Host-pinned: proxy writes after CQ drain, GPU reads in waitFlush().
   uint64_t* flushDonePos_;
 
+  // MT-MSCCL++ tenant ID (design.md §5.2). Piggybacks on every ProxyTrigger
+  // pushed from this handle so the host-side scheduler can multiplex by
+  // tenant. Defaults to 0 (mscclpp::ext::tenant::DEFAULT_TENANT) for backward
+  // compatibility with single-tenant callers.
+  uint32_t tenantId_ = 0;
+
   MSCCLPP_INLINE BasePortChannelDeviceHandle() = default;
 
   MSCCLPP_HOST_DEVICE_INLINE BasePortChannelDeviceHandle(SemaphoreId semaphoreId,
                                                          Host2DeviceSemaphoreDeviceHandle semaphore,
-                                                         FifoDeviceHandle fifo, uint64_t* flushDonePos)
-      : semaphoreId_(semaphoreId), semaphore_(semaphore), fifo_(fifo), flushDonePos_(flushDonePos) {}
+                                                         FifoDeviceHandle fifo, uint64_t* flushDonePos,
+                                                         uint32_t tenantId = 0)
+      : semaphoreId_(semaphoreId),
+        semaphore_(semaphore),
+        fifo_(fifo),
+        flushDonePos_(flushDonePos),
+        tenantId_(tenantId) {}
 
 #if defined(MSCCLPP_DEVICE_COMPILE)
   /// Push a TriggerData to the FIFO.
@@ -59,7 +70,7 @@ struct BasePortChannelDeviceHandle {
   /// @param size The size of the transfer.
   MSCCLPP_DEVICE_INLINE void put(MemoryId dstId, uint64_t dstOffset, MemoryId srcId, uint64_t srcOffset,
                                  uint64_t size) {
-    fifo_.push({TriggerData, dstId, dstOffset, srcId, srcOffset, size, semaphoreId_});
+    fifo_.push({TriggerData, dstId, dstOffset, srcId, srcOffset, size, semaphoreId_, tenantId_});
   }
 
   /// Push a TriggerData to the FIFO.
@@ -72,7 +83,7 @@ struct BasePortChannelDeviceHandle {
   }
 
   /// Push a TriggerFlag to the FIFO.
-  MSCCLPP_DEVICE_INLINE void signal() { fifo_.push({TriggerFlag, 0, 0, 0, 0, 1, semaphoreId_}); }
+  MSCCLPP_DEVICE_INLINE void signal() { fifo_.push({TriggerFlag, 0, 0, 0, 0, 1, semaphoreId_, tenantId_}); }
 
   /// Push a TriggerData and a TriggerFlag at the same time to the FIFO.
   /// @param dstId The ID of destination memory region.
@@ -82,7 +93,7 @@ struct BasePortChannelDeviceHandle {
   /// @param size The size of the transfer.
   MSCCLPP_DEVICE_INLINE void putWithSignal(MemoryId dstId, uint64_t dstOffset, MemoryId srcId, uint64_t srcOffset,
                                            uint64_t size) {
-    fifo_.push({TriggerData | TriggerFlag, dstId, dstOffset, srcId, srcOffset, size, semaphoreId_});
+    fifo_.push({TriggerData | TriggerFlag, dstId, dstOffset, srcId, srcOffset, size, semaphoreId_, tenantId_});
   }
 
   /// Push a TriggerData and a TriggerFlag at the same time to the FIFO.
@@ -103,8 +114,8 @@ struct BasePortChannelDeviceHandle {
   /// @param maxSpinCount The maximum number of spin counts before asserting. Never assert if negative.
   MSCCLPP_DEVICE_INLINE void putWithSignalAndFlush(MemoryId dstId, uint64_t dstOffset, MemoryId srcId,
                                                    uint64_t srcOffset, uint64_t size, int64_t maxSpinCount = 1000000) {
-    uint64_t pos =
-        fifo_.push({TriggerData | TriggerFlag | TriggerSync, dstId, dstOffset, srcId, srcOffset, size, semaphoreId_});
+    uint64_t pos = fifo_.push(
+        {TriggerData | TriggerFlag | TriggerSync, dstId, dstOffset, srcId, srcOffset, size, semaphoreId_, tenantId_});
     detail::waitFlush(flushDonePos_, pos, maxSpinCount);
   }
 
@@ -122,7 +133,7 @@ struct BasePortChannelDeviceHandle {
   /// Push a TriggerSync to the FIFO.
   /// @param maxSpinCount The maximum number of spin counts before asserting. Never assert if negative.
   MSCCLPP_DEVICE_INLINE void flush(int64_t maxSpinCount = 1000000) {
-    uint64_t pos = fifo_.push({TriggerSync, 0, 0, 0, 0, 1, semaphoreId_});
+    uint64_t pos = fifo_.push({TriggerSync, 0, 0, 0, 0, 1, semaphoreId_, tenantId_});
     detail::waitFlush(flushDonePos_, pos, maxSpinCount);
   }
 
@@ -145,8 +156,9 @@ struct PortChannelDeviceHandle : public BasePortChannelDeviceHandle {
 
   MSCCLPP_HOST_DEVICE_INLINE PortChannelDeviceHandle(SemaphoreId semaphoreId,
                                                      Host2DeviceSemaphoreDeviceHandle semaphore, FifoDeviceHandle fifo,
-                                                     MemoryId dst, MemoryId src, uint64_t* flushDonePos)
-      : BasePortChannelDeviceHandle(semaphoreId, semaphore, fifo, flushDonePos), dst_(dst), src_(src) {}
+                                                     MemoryId dst, MemoryId src, uint64_t* flushDonePos,
+                                                     uint32_t tenantId = 0)
+      : BasePortChannelDeviceHandle(semaphoreId, semaphore, fifo, flushDonePos, tenantId), dst_(dst), src_(src) {}
 
 #if defined(MSCCLPP_DEVICE_COMPILE)
   /// Push a TriggerData to the FIFO.
