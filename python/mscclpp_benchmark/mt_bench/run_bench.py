@@ -330,14 +330,19 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
     caps = list(bandwidth_caps_bps) if bandwidth_caps_bps else [0] * num_tenants
     weights_eff = list(weights) if weights else [1] * num_tenants
 
-    proxy_service = TenantAwareProxyService(mode=mode)
-    for i in range(num_tenants):
-        register_tenant_on(proxy_service, i + 1, qos_classes[i],
-                           weights_eff[i], int(caps[i]), 0)
-    proxy_service.start_proxy()
-
-    try:
-        for nelems in sizes:
+    # Iter 4: re-create the proxy_service per size. Iter 2 shrank semaphoreId
+    # in ProxyTrigger from 10→6 bits (max 64 semaphores) to make room for the
+    # 5-bit tenantId. Each MscclppAllReduce3 allocates 6 semaphores per peer-
+    # set, so accumulating across (sizes × tenants) silently overflows the
+    # semaphore-ID field and triggers signal the wrong semaphore — the kernel
+    # then waits forever. Recreating per-size keeps the running count under 64.
+    for nelems in sizes:
+        proxy_service = TenantAwareProxyService(mode=mode)
+        for i in range(num_tenants):
+            register_tenant_on(proxy_service, i + 1, qos_classes[i],
+                               weights_eff[i], int(caps[i]), 0)
+        proxy_service.start_proxy()
+        try:
             algos = {}
             for tid in range(1, num_tenants + 1):
                 mem = GpuBuffer(nelems, dtype=dtype)
@@ -357,9 +362,12 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
 
             # Iter 4: by default we interleave on a SINGLE stream so the
             # C++ scheduler sees per-tenant tagged triggers and reorders them
-            # via the policy. K-parallel-stream mode still hangs in concurrent
-            # AllReduce3 launches (mutual semaphore wait pattern) and is
-            # gated behind MTCCL_K_STREAMS=1 for iter-5 debugging.
+            # via the policy. K-parallel-stream mode hangs because the
+            # AllReduce3 kernel uses a global `__device__ DeviceSyncer` that
+            # two concurrent kernel launches share — its counter doubles past
+            # blockNum and the grid-wide barrier spins forever. Fixing this
+            # needs a per-kernel-instance syncer (iter-5 work); enable with
+            # MTCCL_K_STREAMS=1 for debugging.
             single_stream_mode = os.environ.get("MTCCL_K_STREAMS", "0") != "1"
             if single_stream_mode:
                 streams = {1: cp.cuda.Stream(non_blocking=True)}
@@ -375,18 +383,37 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
                     s.wait_event(start_event)
 
             if use_cuda_graph:
-                # Per-tenant sub-graph captures `niter` AllReduce launches.
-                graphs = {}
-                for tid, s in streams.items():
+                if single_stream_mode:
+                    # Capture niter rounds of K interleaved AllReduce launches
+                    # into a single graph on the shared stream. The C++ proxy
+                    # scheduler still sees per-tenant tagged triggers and
+                    # reorders them per policy at graph-launch time.
+                    s = primary
                     with s:
                         s.begin_capture()
                         for _ in range(niter):
-                            algos[tid][0](s)
-                        graphs[tid] = s.end_capture()
-                # Launch all in parallel.
-                for tid, g in graphs.items():
-                    g.launch(streams[tid])
-                    end_events[tid].record(streams[tid])
+                            for tid in range(1, num_tenants + 1):
+                                algos[tid][0](s)
+                        graph = s.end_capture()
+                    graph.launch(s)
+                    # All tenants collapse to the same end point on a single
+                    # stream; record per-tenant events back-to-back so each
+                    # has a valid timestamp.
+                    for tid in range(1, num_tenants + 1):
+                        end_events[tid].record(s)
+                else:
+                    # Per-tenant sub-graph captures `niter` AllReduce launches.
+                    graphs = {}
+                    for tid, s in streams.items():
+                        with s:
+                            s.begin_capture()
+                            for _ in range(niter):
+                                algos[tid][0](s)
+                            graphs[tid] = s.end_capture()
+                    # Launch all in parallel.
+                    for tid, g in graphs.items():
+                        g.launch(streams[tid])
+                        end_events[tid].record(streams[tid])
             else:
                 if single_stream_mode:
                     s = primary
@@ -442,8 +469,8 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
                           f"{human_size(mem_bytes):>8s}  "
                           f"{time_us:8.2f} us  {bw:7.2f} GB/s", flush=True)
             comm.barrier()
-    finally:
-        proxy_service.stop_proxy()
+        finally:
+            proxy_service.stop_proxy()
 
 
 def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
