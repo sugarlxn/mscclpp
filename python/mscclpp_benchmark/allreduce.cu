@@ -292,9 +292,20 @@ extern "C" __global__ void __launch_bounds__(1024, 1)
 // AllReduce3
 // -------------------------------------------
 
+// MT-MSCCL++ iter 6: `syncer` is a per-instance DeviceSyncer pointer. The
+// previous version used the file-scope `__device__ DeviceSyncer deviceSyncer;`,
+// which two concurrent allreduce3 launches on different streams would SHARE
+// — their counter went up to 2× blockNum and the grid-wide barrier spun
+// forever. By passing a per-instance syncer, each MscclppAllReduce3 Python
+// object owns its own counter, so K-stream concurrent launches actually work.
+//
+// `syncer` MUST be allocated in GPU global memory and zero-initialized
+// (cp.zeros) before the FIRST kernel launch; the Python wrapper does this
+// in MscclppAllReduce3.__init__.
 extern "C" __global__ void __launch_bounds__(1024, 1)
     allreduce3(mscclpp::PortChannelDeviceHandle* fstRoundChans, mscclpp::PortChannelDeviceHandle* sndRoundChans,
-               TYPE* buff, TYPE* scratch, int rank, int worldSize, size_t nelems) {
+               TYPE* buff, TYPE* scratch, int rank, int worldSize, size_t nelems,
+               mscclpp::DeviceSyncer* syncer) {
   nelems = nelems / (sizeof(int) / sizeof(TYPE));
 
   int isComm = (threadIdx.x == 0) && (blockIdx.x == 0);
@@ -327,7 +338,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1)
       }
       devFstSendChan.putWithSignal(offset + chunkNelem / 2 * sizeof(int), (chunkNelem - chunkNelem / 2) * sizeof(int));
     }
-    deviceSyncer.sync(gridDim.x);
+    syncer->sync(gridDim.x);
 
     // Reduce
     chunkIndex = (rank + worldSize - step) % worldSize;
@@ -343,7 +354,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1)
         devFstSendChan.putWithSignal(offset, chunkNelem / 2 * sizeof(int));
       }
     }
-    deviceSyncer.sync(gridDim.x);
+    syncer->sync(gridDim.x);
 
     dst += chunkNelem / 2;
     src += chunkNelem / 2;
@@ -358,7 +369,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1)
     }
     devFstSendChan.putWithSignal(offset + chunkNelem / 2 * sizeof(int), (chunkNelem - chunkNelem / 2) * sizeof(int));
   }
-  deviceSyncer.sync(gridDim.x);
+  syncer->sync(gridDim.x);
 
   offset = rank * chunkNelem * sizeof(int);
   int* dst = (int*)((char*)buff + offset);
@@ -372,7 +383,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1)
       devSndSendChan.putWithSignal(offset, chunkNelem / 2 * sizeof(int));
     }
   }
-  deviceSyncer.sync(gridDim.x);
+  syncer->sync(gridDim.x);
 
   dst += chunkNelem / 2;
   src += chunkNelem / 2;
@@ -392,7 +403,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1)
     if (isComm) {
       devSndRecvChan.wait();
     }
-    deviceSyncer.sync(gridDim.x);
+    syncer->sync(gridDim.x);
 
     // Copy
     chunkIndex = (rank + worldSize - i) % worldSize;

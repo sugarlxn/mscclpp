@@ -362,12 +362,17 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
 
             # Iter 4: by default we interleave on a SINGLE stream so the
             # C++ scheduler sees per-tenant tagged triggers and reorders them
-            # via the policy. K-parallel-stream mode hangs because the
-            # AllReduce3 kernel uses a global `__device__ DeviceSyncer` that
-            # two concurrent kernel launches share — its counter doubles past
-            # blockNum and the grid-wide barrier spins forever. Fixing this
-            # needs a per-kernel-instance syncer (iter-5 work); enable with
-            # MTCCL_K_STREAMS=1 for debugging.
+            # via the policy.
+            # Iter 6: K-parallel-stream mode now WORKS — the AllReduce3 kernel
+            # has been rewritten to take a per-instance DeviceSyncer pointer
+            # (see allreduce.cu + mscclpp_op.py:MscclppAllReduce3). Setting
+            # MTCCL_K_STREAMS=1 launches each tenant on its own stream so the
+            # GPU runs concurrent AllReduce kernels and the proxy thread sees
+            # concurrent triggers, exposing real C++ DRR / Priority behavior.
+            # NOTE: on intra-node NVLink the GPU compute is the bottleneck,
+            # not the proxy queue, so DRR weight effects on bandwidth are
+            # subtle. The host-only smoke test (test/unit/iter5_standalone
+            # _smoke.cc) is the authoritative proof of scheduler correctness.
             single_stream_mode = os.environ.get("MTCCL_K_STREAMS", "0") != "1"
             if single_stream_mode:
                 streams = {1: cp.cuda.Stream(non_blocking=True)}
@@ -378,6 +383,9 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
             end_events = {tid: cp.cuda.Event() for tid in algos}
             primary = list(streams.values())[0]
             start_event.record(primary)
+            # Iter 6: host wall-clock anchor for hard-cap proof. We stash it
+            # on the function object so the post-sync block can read it.
+            run_multi_tenant_cpp._last_wall_start = time.time()
             for s in streams.values():
                 if s is not primary:
                     s.wait_event(start_event)
@@ -430,18 +438,27 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
                             algos[tid][0](s)
                         end_events[tid].record(s)
 
+            # Iter 6 wall-clock anchor for the rate-limit metric. Captured
+            # AFTER the GPU sync to bound the wall window.
+            wall_start_s_cpp = getattr(run_multi_tenant_cpp, "_last_wall_start", time.time())
             for s in streams.values():
                 s.synchronize()
+            wall_end_s_cpp = time.time()
             comm.barrier()
 
             mem_bytes = algos[1][1].nbytes
             if rank == 0:
+                wall_s_cpp = max(wall_end_s_cpp - wall_start_s_cpp, 1e-9)
                 for tid in range(1, num_tenants + 1):
                     span_ms = cp.cuda.get_elapsed_time(start_event,
                                                       end_events[tid])
                     ms_per_iter = span_ms / niter
                     time_us = ms_per_iter * 1000.0
                     bw = alg_bw_gbps(mem_bytes, time_us)
+                    # Wall-clock bytes/sec — proves rate-limit hard caps
+                    # in cpp_mt path. niter kernels per tenant, each msg_bytes.
+                    bytes_sent_cpp = niter * mem_bytes
+                    wallclock_bps_cpp = bytes_sent_cpp / wall_s_cpp
                     qos = qos_classes[tid - 1]
                     # Iter5 honesty note: single-stream mode collapses all
                     # tenant kernels onto one stream → tenants execute
@@ -452,9 +469,17 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
                     # are expected to converge. The "single_stream_smoke"
                     # suffix flags this in downstream analysis so it isn't
                     # mistaken for a fairness / priority isolation result.
+                    #
+                    # Iter6: MTCCL_K_STREAMS=1 enables per-tenant independent
+                    # streams + per-instance DeviceSyncer (kernel rewrite),
+                    # so concurrent kernel launches actually race for the
+                    # C++ proxy queue and DRR/Priority reorder for real.
+                    # Use "_kstream" suffix in that case.
                     backend_label = f"mscclpp_cpp_mt_{mode.name.lower()}"
                     if single_stream_mode:
                         backend_label += "_single_stream_smoke"
+                    else:
+                        backend_label += "_kstream"
                     results.append({
                         "run_id": run_id,
                         "timestamp": datetime.utcnow().isoformat(),
@@ -468,6 +493,10 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
                         "niter": niter,
                         "time_us": round(time_us, 3),
                         "alg_bw_gbps": round(bw, 3),
+                        # Iter 6 wall-clock metric for hard-cap proof.
+                        "wallclock_gbps": round(wallclock_bps_cpp / 1e9, 3),
+                        "wall_s": round(wall_s_cpp, 6),
+                        "bytes_sent": bytes_sent_cpp,
                         "rank": rank,
                         "world_size": comm.size,
                         "host": socket.gethostname(),
@@ -580,23 +609,43 @@ def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
             start_event = cp.cuda.Event()
             end_events = {tid: cp.cuda.Event() for tid in range(1, num_tenants + 1)}
             start_event.record(stream)
+            # Iter 6: host wall-clock anchor for the rate-limit metric (P3).
+            # Captured AFTER the GPU start_event so the wall-clock window is
+            # an upper bound on what the bucket actually rate-limited.
+            wall_start_s = time.time()
             for idx, it in enumerate(order):
                 algo(stream)
                 if idx == last_idx_for.get(it.tenant_id):
                     end_events[it.tenant_id].record(stream)
+            # Iter 6: capture wall-clock start/end of the entire ordered run
+            # so we can compute per-tenant `wallclock_bps = bytes_sent / wall_s`.
+            # This is the metric that actually proves `bandwidth_max_bps` hard
+            # caps, unlike `alg_bw_gbps = msg_size / per-iter time` which
+            # measures GPU completion time and is independent of how long the
+            # bucket made other tenants wait.
             stream.synchronize()
+            wall_end_s = time.time()
             comm.barrier()
 
             if rank == 0:
                 total_calls_per_tenant = {tid: 0 for tid in range(1, num_tenants + 1)}
                 for it in order:
                     total_calls_per_tenant[it.tenant_id] += 1
+                # Wall-clock window from the host's POV. The scheduler-driven
+                # launch loop ran between (wall_start_s, wall_end_s); during
+                # that window we sent `iters * msg_bytes` per tenant. If the
+                # token bucket throttles tenant T to X GB/s, the bytes/s
+                # measured here should converge to X for sufficiently long
+                # runs (large `niter` × large `msg_bytes`).
+                wall_s = max(wall_end_s - wall_start_s, 1e-9)
                 for tid in range(1, num_tenants + 1):
                     span_ms = cp.cuda.get_elapsed_time(start_event, end_events[tid])
                     iters = total_calls_per_tenant[tid] or 1
                     ms_per_iter = span_ms / iters
                     time_us = ms_per_iter * 1000.0
                     bw = alg_bw_gbps(memory.nbytes, time_us)
+                    bytes_sent = iters * memory.nbytes
+                    wallclock_bps = bytes_sent / wall_s
                     qos = qos_classes[tid - 1]
                     results.append({
                         "run_id": run_id,
@@ -611,6 +660,10 @@ def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
                         "niter": niter,
                         "time_us": round(time_us, 3),
                         "alg_bw_gbps": round(bw, 3),
+                        # Iter 6 honest metric: wall-clock bytes/sec.
+                        "wallclock_gbps": round(wallclock_bps / 1e9, 3),
+                        "wall_s": round(wall_s, 6),
+                        "bytes_sent": bytes_sent,
                         "rank": rank,
                         "world_size": comm.size,
                         "host": socket.gethostname(),
@@ -620,7 +673,8 @@ def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
                                if caps[tid - 1] > 0 else "")
                     print(f"  [tenant {tid} qos={qos.name:10s}{cap_str}] "
                           f"{human_size(memory.nbytes):>8s}  "
-                          f"{time_us:8.2f} us  {bw:7.2f} GB/s", flush=True)
+                          f"{time_us:8.2f} us  {bw:7.2f} GB/s alg | "
+                          f"{wallclock_bps/1e9:6.2f} GB/s wall", flush=True)
             comm.barrier()
     finally:
         proxy_service.stop_proxy()
@@ -762,6 +816,23 @@ def main():
                              mode=PolicyMode.FAIR, weights=[1, 3],
                              use_cuda_graph=use_graph)
 
+    if "cpp_mt_rate_limited" in scenarios:
+        # Iter 6: prove the C++ token bucket actually caps tenant 2's
+        # wall-clock bandwidth. On intra-node NVLink the GPU compute is the
+        # bottleneck for raw AllReduce, but the C++ scheduler's bucket can
+        # still rate-limit the trigger DISPATCH rate — visible in
+        # wallclock_gbps for sufficiently long bursts.
+        cap_bps_cpp = int(args.rate_cap_gbps * 1e9)
+        if rank == 0:
+            print(f"\n--- scenario: cpp_mt_rate_limited "
+                  f"(C++ in-proxy, FAIR, tenant 2 capped @ {args.rate_cap_gbps:g} GB/s) ---",
+                  flush=True)
+        run_multi_tenant_cpp("cpp_mt_rate_limited", 2, sizes, args.niter,
+                             group, nccl_comm, dtype, comm, rank, results, run_id,
+                             mode=PolicyMode.FAIR,
+                             bandwidth_caps_bps=[0, cap_bps_cpp],
+                             use_cuda_graph=use_graph)
+
     if "priority" in scenarios:
         if rank == 0:
             print("\n--- scenario: priority_contention (1 Premium + 2 BestEffort) ---",
@@ -776,10 +847,12 @@ def main():
     if rank == 0:
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
         # Stable canonical schema so multiple runs concatenate cleanly.
+        # Iter 6: added wallclock_gbps / wall_s / bytes_sent for hard-cap proof.
         FIELDS = [
             "run_id", "timestamp", "scenario", "backend", "collective",
             "tenant_id", "qos_class", "size_bytes", "size_human", "niter",
-            "time_us", "alg_bw_gbps", "rank", "world_size", "host", "dtype",
+            "time_us", "alg_bw_gbps", "wallclock_gbps", "wall_s", "bytes_sent",
+            "rank", "world_size", "host", "dtype",
         ]
         write_header = not os.path.exists(args.out)
         with open(args.out, "a", newline="") as f:

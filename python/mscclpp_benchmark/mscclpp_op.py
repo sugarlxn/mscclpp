@@ -205,6 +205,14 @@ class MscclppAllReduce3:
         self.fst_device_handles_cp = cp.asarray(memoryview(b"".join(self.fst_device_handles)), dtype=cp.uint8)
         self.snd_device_handles_cp = cp.asarray(memoryview(b"".join(self.snd_device_handles)), dtype=cp.uint8)
 
+        # MT-MSCCL++ iter 6: per-instance DeviceSyncer. The kernel was changed
+        # to take a `DeviceSyncer*` parameter instead of the file-scope global,
+        # so concurrent kernel launches on different streams don't share
+        # barrier counter state. sizeof(DeviceSyncer) = 3 × uint + 1 × uint
+        # = 16 bytes; allocate a small zero-initialized GPU buffer per instance.
+        # See include/mscclpp/concurrency_device.hpp for the struct.
+        self._syncer_buffer = cp.zeros(16, dtype=cp.uint8)
+
         self.set_params(nblocks, block_size)
 
     def __call__(self, stream):
@@ -223,6 +231,7 @@ class MscclppAllReduce3:
             self.group.my_rank,
             self.group.nranks,
             ctypes.c_size_t(self.memory.size),
+            self._syncer_buffer,  # MT-MSCCL++ iter 6: per-instance DeviceSyncer*
         )
 
     def auto_tune(self):
