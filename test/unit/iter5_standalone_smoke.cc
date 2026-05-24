@@ -452,9 +452,8 @@ void test_drr_weighted_different_conn_keys() {
   CHECK(ratio >= 2.5 && ratio <= 3.5, "weight ratio 1:3 produces dispatch ratio ~3");
 }
 
-// Progress hook: simulate the proxy thread calling tickProgress() between
-// FIFO polls. After we artificially leave a trigger in the queue (by rate-
-// limit dry on initial enqueue), tickProgress should pick it up later.
+// Progress hook (basic): tickProgress drains queued triggers without
+// fresh push. Doesn't exercise rate-limit yet — see next test for that.
 void test_progress_hook_no_starve() {
   std::printf("[test] tickProgress drains when no new triggers arrive\n");
   Recorder rec;
@@ -462,12 +461,8 @@ void test_progress_hook_no_starve() {
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
 
-  // Push two triggers on different conn keys; both should get drained.
   h(makeTrigger(1, 0, TriggerData, 1024), makeCtx(1));
   h(makeTrigger(2, 1, TriggerData, 1024), makeCtx(2));
-
-  // At this point at least one is dispatched (drain-once per operator())
-  // but may be one queued. Call tickProgress repeatedly without new triggers.
   size_t before = rec.records.size();
   for (int i = 0; i < 10; ++i) h.tickProgress();
   size_t after = rec.records.size();
@@ -475,6 +470,136 @@ void test_progress_hook_no_starve() {
   std::printf("  before tick: %zu, after tick: %zu\n", before, after);
   CHECK(after >= before, "tickProgress never regresses dispatches");
   CHECK(rec.records.size() == 2, "all queued triggers drained via tickProgress");
+}
+
+// Progress hook + rate limit: real test of the design.md §5.3.3 scenario.
+// A tenant has a small bucket; first trigger drains it; subsequent triggers
+// stay queued; tickProgress returns no-op until enough time passes for
+// refill; then tick drains them.
+//
+// Also verifies fix #1 (DRR rollback): when bucket is dry, deficit_ is
+// NOT consumed, so refilled bucket lets the trigger dispatch normally.
+void test_progress_hook_bucket_dry_then_refill() {
+  std::printf("[test] tickProgress drains rate-limited tenant after refill\n");
+  Recorder rec;
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  // Tenant 1: 10 MB/s refill, 4 KB burst. Each trigger is 4 KB → first one
+  // empties the bucket; the rest wait for refill (~400 us per refill).
+  h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0},
+                 {/*bytes_per_second=*/10ULL * 1024 * 1024, /*burst_bytes=*/4096, 0});
+  h.updateTenant({2, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
+
+  // Stage 3 t1 triggers (same connKey so they serialize) + 1 t2 trigger
+  // (to ensure multi-tenant slow path, no bypass).
+  h.enqueueForTest(makeTrigger(2, 99, TriggerData, 1024), makeCtx(0));
+  h.enqueueForTest(makeTrigger(1, 50, TriggerData, 4096), makeCtx(1));
+  h.enqueueForTest(makeTrigger(1, 50, TriggerData, 4096), makeCtx(2));
+  h.enqueueForTest(makeTrigger(1, 50, TriggerData, 4096), makeCtx(3));
+
+  // Burst-drain: tick many times immediately. Tenant 2's trigger drains
+  // (no limit); tenant 1's first 4KB trigger drains (bucket exactly fits);
+  // subsequent t1 triggers BLOCK because bucket is empty.
+  size_t before = rec.records.size();
+  for (int i = 0; i < 10; ++i) h.tickProgress();
+  size_t pendingAfter = h.pendingCountForTest();
+  std::printf("  initial burst-drain: dispatched=%zu, pending=%zu\n",
+              rec.records.size() - before, pendingAfter);
+  int t1Dispatched = 0, t2Dispatched = 0;
+  for (size_t i = before; i < rec.records.size(); ++i) {
+    if (std::get<0>(rec.records[i]) == 1) t1Dispatched++;
+    if (std::get<0>(rec.records[i]) == 2) t2Dispatched++;
+  }
+  CHECK(t2Dispatched == 1, "t2 (no rate limit) dispatched immediately");
+  CHECK(t1Dispatched == 1, "exactly 1 of 3 t1 triggers fit in initial 4 KB burst");
+  CHECK(pendingAfter == 2, "2 t1 triggers wait for refill");
+
+  // Sleep enough for bucket to refill (4 KB / 10 MB/s ≈ 400 us; sleep 2 ms).
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  size_t beforeTick = rec.records.size();
+  h.tickProgress();
+  CHECK(rec.records.size() == beforeTick + 1, "1 more t1 dispatched after refill");
+
+  // Keep ticking + sleeping until drained.
+  for (int i = 0; i < 20; ++i) {
+    if (h.pendingCountForTest() == 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    h.tickProgress();
+  }
+  CHECK(h.pendingCountForTest() == 0, "all t1 triggers eventually drain after refill");
+}
+
+// Real aging test: BE trigger sits in queue with ANCIENT enqueueNs while a
+// non-empty Premium queue exists (no bypass). Without aging, BE would starve.
+// With aging, BE's effective priority surpasses Premium.
+void test_aging_real_not_bypass() {
+  std::printf("[test] aging promotes long-waiting BestEffort over Premium (no bypass)\n");
+  Recorder rec;
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority);
+  h.updateTenant({1, QoSClass::Premium, 1, 0, 0, 0, 0}, {0, 0, 0});
+  h.updateTenant({2, QoSClass::BestEffort, 1, 0, 0, 0, 0}, {0, 0, 0});
+
+  // BE trigger with ancient enqueueNs (=1, so now-1 ≫ 100 ms threshold).
+  ProxyFifoContext oldCtx{};
+  oldCtx.fifoPos = 1;
+  oldCtx.enqueueNs = 1;
+  h.enqueueForTest(makeTrigger(/*tid=*/2, /*sem=*/10, TriggerData, 1024), oldCtx);
+
+  // 5 fresh Premium on a DIFFERENT connKey (so per-conn ordering doesn't
+  // serialize them with BE) with current enqueueNs (no aging).
+  uint64_t nowNs = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  for (int i = 0; i < 5; ++i) {
+    ProxyFifoContext c{};
+    c.fifoPos = 100 + i;
+    c.enqueueNs = nowNs;
+    h.enqueueForTest(makeTrigger(/*tid=*/1, /*sem=*/11, TriggerData, 1024), c);
+  }
+
+  std::vector<uint32_t> order;
+  while (h.pendingCountForTest() > 0 && order.size() < 10) {
+    size_t prev = rec.records.size();
+    h.tickProgress();
+    if (rec.records.size() > prev) {
+      order.push_back(std::get<0>(rec.records.back()));
+    }
+  }
+  std::printf("  dispatch order: ");
+  for (auto t : order) std::printf("%u ", t);
+  std::printf("\n");
+  // Without aging: 1,1,1,1,1,2. With aging: 2,1,1,1,1,1.
+  CHECK(order.size() == 6, "6 triggers dispatched");
+  CHECK(order[0] == 2, "aged BestEffort dispatched FIRST (aging beat Premium)");
+  for (size_t i = 1; i < order.size(); ++i) {
+    CHECK(order[i] == 1, "remaining are Premium");
+  }
+}
+
+// TokenBucket fix: a trigger larger than burst must NOT permanently deadlock.
+void test_token_bucket_oversized_trigger() {
+  std::printf("[test] TokenBucket allows n > burst after bucket fills\n");
+  using mscclpp::ext::tenant::TokenBucket;
+  TokenBucket bucket(/*refillBps=*/100ULL * 1024 * 1024, /*burst=*/4096);
+  // Initial bucket = burst (4 KB full). 1 MB trigger >> burst.
+  CHECK(bucket.wouldConsume(1024 * 1024), "1MB peek OK when bucket is full");
+  CHECK(bucket.tryConsume(1024 * 1024), "1MB consume OK when bucket is full");
+  // Immediately after, tokens drained to 0; refill takes time. Wouldn't
+  // pass a peek for 2× burst because the bucket hasn't refilled past burst.
+  // (We can't assert wouldConsume(1) == false because refill happens in real
+  //  time and even microseconds give >1 byte at 100 MB/s.)
+  CHECK(!bucket.wouldConsume(2 * 4096), "right after consume, bucket has < 2×burst");
+
+  // Wait for full refill (burst / refillBps = 4KB / 100MB/s ≈ 40 us; sleep 1 ms).
+  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  CHECK(bucket.wouldConsume(1024 * 1024), "1MB peek OK again after refill");
+  CHECK(bucket.tryConsume(1024 * 1024), "1MB consume OK again after refill");
+
+  // Critical regression: even after MANY oversized consumes, the bucket
+  // never permanently dries. Each consume succeeds eventually after refill.
+  for (int i = 0; i < 5; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(bucket.tryConsume(1024 * 1024), "iterative 1MB consume keeps making progress");
+  }
 }
 
 int main() {
@@ -489,7 +614,10 @@ int main() {
   test_drr_weighted_with_prefilled_queues();
   test_drr_weighted_different_conn_keys();
   test_priority_aging();
+  test_aging_real_not_bypass();
   test_progress_hook_no_starve();
+  test_progress_hook_bucket_dry_then_refill();
+  test_token_bucket_oversized_trigger();
 
   std::printf("\n=== iter5 standalone: %d passed, %d failed ===\n", g_passed, g_failed);
   return g_failed == 0 ? 0 : 1;

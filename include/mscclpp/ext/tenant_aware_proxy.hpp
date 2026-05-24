@@ -73,15 +73,47 @@ class TokenBucket {
   }
 
   /// Try to consume `n` bytes. Returns true if allowed, false if bucket is dry.
+  ///
+  /// v0.2.2 (iter 5.7): handle n > burstBytes_ without permanent deadlock.
+  /// The bucket caps tokens_ at burstBytes_; a naive `tokens_ >= n` check
+  /// would never succeed once n exceeds burst. We treat the effective
+  /// requirement as `min(n, burst)` — so a too-big trigger has to wait for
+  /// a FULL bucket (tokens >= burst) and then drains it completely. This
+  /// effectively serializes oversized triggers at one-per-(burst / refill)
+  /// interval, which approximates the rate while guaranteeing progress.
+  ///
+  /// Callers should still configure burst >= max expected trigger size for
+  /// strict rate accuracy; this code path is a safety net for misconfigured
+  /// or unexpectedly large messages, NOT the recommended operating regime.
   bool tryConsume(uint64_t n) {
     std::lock_guard<std::mutex> g(mu_);
     refillLocked();
-    if (refillBps_ == 0 || tokens_ >= static_cast<double>(n)) {
+    if (refillBps_ == 0) {
+      // Unlimited.
+      return true;
+    }
+    // Effective threshold: never demand more than the bucket can hold.
+    double need = static_cast<double>(std::min<uint64_t>(n, burstBytes_));
+    if (tokens_ >= need) {
+      // Deduct the FULL n (or as much as we can without going below 0).
+      // If n > burst this drains the bucket to 0 and counts the overrun
+      // as "future debt" already paid — we won't double-throttle.
       tokens_ -= static_cast<double>(n);
       if (tokens_ < 0) tokens_ = 0;
       return true;
     }
     return false;
+  }
+
+  /// Non-mutating peek: would tryConsume(n) succeed at this instant?
+  /// Used by progress-hook / scheduler eligibility checks that don't want
+  /// to perturb the bucket.
+  bool wouldConsume(uint64_t n) {
+    std::lock_guard<std::mutex> g(mu_);
+    refillLocked();
+    if (refillBps_ == 0) return true;
+    double need = static_cast<double>(std::min<uint64_t>(n, burstBytes_));
+    return tokens_ >= need;
   }
 
  private:
@@ -273,20 +305,41 @@ class TenantAwareProxyHandler {
     // trigger and immediately drains. We process AT MOST one trigger here
     // and release the queue lock before invoking inner_, which keeps the
     // mutex hold time bounded (inner_ may block on conn.flush()).
+    //
+    // v0.2.2 (iter 5.7) fix: pickNextLocked may MUTATE DRR state (credit /
+    // decrement deficit, advance drrCurrent_/drrCursor_). If we then find
+    // the token bucket is dry, two things go wrong:
+    //   (a) the size-decrement was speculative and must be REFUNDED, else
+    //       the tenant silently loses credit;
+    //   (b) drrCurrent_ may still point at this tenant (sticky DRR), so
+    //       a naive retry will spin on the same rate-limited tenant
+    //       forever and starve everyone else.
+    // Fix: on tryConsume failure, refund the size to deficit[picked] but
+    // KEEP any earned credit (the credit was legitimately issued for the
+    // tenant's turn). Force drrCurrent_ off this tenant and advance the
+    // round-robin cursor past it so other tenants get served.
     PendingTrigger picked{};
     uint32_t pickedTid = MAX_TENANTS;
     uint64_t size = 0;
     {
       std::lock_guard<std::mutex> g(mu_);
+
       pickedTid = pickNextLocked();
       if (pickedTid >= MAX_TENANTS) return ProxyHandlerResult::Continue;
       auto& q = queues_[pickedTid];
       if (q.empty()) return ProxyHandlerResult::Continue;
       picked = q.front();
       size = static_cast<uint64_t>(picked.trigger.fst & ((uint64_t{1} << TriggerBitsSize) - 1));
+
       // Rate limit check (bucket has its own internal mutex; cheap).
       if (!buckets_[pickedTid].tryConsume(size == 0 ? 1 : size)) {
-        // Bucket dry — keep trigger queued; we'll retry on next operator() call.
+        // Bucket dry. Refund the size that pickDrrLocked speculatively
+        // decremented from this tenant's deficit; leave any credit issued
+        // this turn intact. Then push drrCurrent_ off this tenant so the
+        // next pick walks phase 2 and gives someone else a turn.
+        deficit_[pickedTid] += static_cast<int64_t>(size == 0 ? 1 : size);
+        drrCurrent_ = MAX_TENANTS;
+        drrCursor_ = (pickedTid + 1) % MAX_TENANTS;
         return ProxyHandlerResult::Continue;
       }
       q.pop_front();

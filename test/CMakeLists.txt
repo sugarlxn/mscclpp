@@ -51,6 +51,18 @@ target_include_directories(unit_tests ${TEST_INC_COMMON} ${TEST_INC_INTERNAL})
 add_subdirectory(unit)
 add_test(NAME unit_tests COMMAND unit_tests)
 
+# Iter 5.7 host-only smoke test — exercises the MT-MSCCL++ host-side
+# scheduler (DRR, aging, progress hook, token bucket, fail-open) without
+# requiring a GPU or MPI. Useful as a CI gate that catches scheduler
+# regressions even on machines without CUDA, and as a focused fast
+# (<1 s) regression target. Builds even if MSCCLPP_BUILD_TESTS=OFF would
+# normally skip the GPU-bound test executables, since this one is
+# explicitly host-pure.
+add_executable(host_smoke_test unit/iter5_standalone_smoke.cc)
+target_link_libraries(host_smoke_test mscclpp Threads::Threads)
+target_include_directories(host_smoke_test ${TEST_INC_COMMON})
+add_test(NAME host_smoke_test COMMAND host_smoke_test)
+
 # Multi-process unit tests
 add_executable(mp_unit_tests)
 target_link_libraries(mp_unit_tests ${TEST_LIBS_COMMON} test_framework MPI::MPI_CXX)
