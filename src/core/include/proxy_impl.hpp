@@ -14,7 +14,12 @@
 namespace mscclpp {
 
 struct Proxy::Impl {
+  // Legacy handler (ProxyTrigger only). Always populated. The proxy thread
+  // uses this UNLESS contextHandler is also set, in which case the context
+  // handler takes precedence — see design.md §5.7 (v0.2.1) for why context
+  // (= per-poll fifoPos) is required for tenant scheduling.
   ProxyHandler handler;
+  ContextProxyHandler contextHandler;  // optional; preferred when non-empty
   std::function<void()> threadInit;
   std::function<void()> progressHandler;
   std::shared_ptr<Fifo> fifo;
@@ -31,6 +36,11 @@ struct Proxy::Impl {
 
   // Must be called before start() — the proxy thread captures progressHandler at start time.
   void setProgressHandler(std::function<void()> h) { progressHandler = std::move(h); }
+
+  // Must be called before start(). When set, the proxy thread captures
+  // fifoPos = fifo->tail() AT POLL TIME (before pop()) and dispatches via
+  // this context-aware handler. The legacy `handler` is ignored in that case.
+  void setContextHandler(ContextProxyHandler h) { contextHandler = std::move(h); }
 };
 
 }  // namespace mscclpp

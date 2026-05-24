@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#include <chrono>
 #include <mscclpp/core.hpp>
 #include <mscclpp/gpu_utils.hpp>
 #include <mscclpp/numa.hpp>
@@ -53,7 +54,10 @@ MSCCLPP_API_CPP void Proxy::start(bool blocking) {
 
     pimpl_->threadStarted.store(true, std::memory_order_release);
 
+    // Snapshot handler pointers at thread start (avoid per-iteration atomics).
+    // ctxHandler takes priority when set; otherwise legacy handler is used.
     ProxyHandler handler = pimpl_->handler;
+    ContextProxyHandler ctxHandler = pimpl_->contextHandler;
     auto progressHandler = pimpl_->progressHandler;
     auto fifo = pimpl_->fifo;
     ProxyTrigger trigger;
@@ -77,7 +81,20 @@ MSCCLPP_API_CPP void Proxy::start(bool blocking) {
       }
       trigger.snd ^= (uint64_t{1} << uint64_t{63});  // this is where the last bit of snd is reverted.
 
-      ProxyHandlerResult result = handler(trigger);
+      // MT-MSCCL++ (design.md §5.7, v0.2.1): capture fifoPos BEFORE the
+      // handler may delay dispatch (e.g. via TenantAwareProxyHandler). At
+      // this point the proxy thread is the sole FIFO consumer and has not
+      // yet called pop(), so `fifo->tail()` is the exact push-time position
+      // of this trigger. After pop() runs (below), `tail()` advances and is
+      // no longer trustworthy for delayed dispatchers.
+      ProxyFifoContext ctx{};
+      ctx.fifoPos = fifo->tail();
+      ctx.enqueueNs = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count());
+
+      ProxyHandlerResult result = ctxHandler ? ctxHandler(trigger, ctx) : handler(trigger);
 
       // Send completion: reset only the high 64 bits
       fifo->pop();

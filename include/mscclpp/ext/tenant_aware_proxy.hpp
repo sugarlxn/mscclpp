@@ -111,8 +111,9 @@ class TokenBucket {
 
 /// Tenant-aware decorator over a `ProxyHandler`.
 ///
-/// Maintains up-to-32 per-tenant FIFOs internally (5-bit tenantId in the
-/// current code; design v0.2 narrows this to 4 bits / MAX_TENANTS=16). On every
+/// Maintains up-to-16 per-tenant FIFOs internally (4-bit tenantId after the
+/// design v0.2.1 bit-layout change in fifo_device.hpp; bit 63 is reserved for
+/// the FIFO push() XOR and must not be touched by business fields). On every
 /// trigger it:
 ///   (1) extracts trigger.fields.tenantId,
 ///   (2) fail-open: an unregistered tenantId is rewritten to DEFAULT_TENANT
@@ -125,12 +126,12 @@ class TokenBucket {
 /// Returns Continue/Stop matching the inner handler's last call.
 class TenantAwareProxyHandler {
  public:
-  TenantAwareProxyHandler(ProxyHandler inner, PolicyMode mode = PolicyMode::SinglePassthrough)
+  TenantAwareProxyHandler(ContextProxyHandler inner, PolicyMode mode = PolicyMode::SinglePassthrough)
       : inner_(std::move(inner)), mode_(mode) {}
 
   /// Re-point the inner handler (used by TenantAwareProxyService, where the
   /// handler is created before the inner is known).
-  void setInner(ProxyHandler inner) { inner_ = std::move(inner); }
+  void setInner(ContextProxyHandler inner) { inner_ = std::move(inner); }
 
   /// Register / update a tenant. Thread-safe.
   void updateTenant(const TenantContext& ctx, const BandwidthBudget& budget) {
@@ -151,20 +152,22 @@ class TenantAwareProxyHandler {
   void setMode(PolicyMode mode) { mode_ = mode; }
   PolicyMode mode() const { return mode_; }
 
-  /// Returns a callable usable as a ProxyHandler (std::function compatible).
-  ProxyHandler asHandler() {
-    return [this](ProxyTrigger t) -> ProxyHandlerResult { return this->operator()(t); };
+  /// Returns a callable usable as a ContextProxyHandler (std::function compatible).
+  ContextProxyHandler asHandler() {
+    return [this](ProxyTrigger t, ProxyFifoContext ctx) -> ProxyHandlerResult {
+      return this->operator()(t, ctx);
+    };
   }
 
-  /// Direct invocation (design.md §5.5).
+  /// Direct invocation (design.md §5.5 / §5.7, v0.2.1).
   ///
   /// Dispatch order is critical — see iter5 header comment:
   ///   1. parse tenantId
   ///   2. fail-open unregistered tenants to DEFAULT_TENANT
   ///   3. update activeMask (so this very trigger's tenant counts toward bypass)
   ///   4. bypass iff active<=1 AND every per-tenant queue is empty
-  ///   5. otherwise enqueue + drain
-  ProxyHandlerResult operator()(ProxyTrigger trig) {
+  ///   5. otherwise enqueue (carrying ORIGINAL fifoPos from ctx) + drain
+  ProxyHandlerResult operator()(ProxyTrigger trig, ProxyFifoContext ctx) {
     if (!inner_) {
       // Misconfigured: setHandlerDecorator must wire inner_ before triggers flow.
       fprintf(stderr, "[mt-mscclpp] FATAL: TenantAwareProxyHandler inner_ is empty\n");
@@ -178,9 +181,11 @@ class TenantAwareProxyHandler {
 
     // (2) Fail-open: unregistered tenants are reattributed to DEFAULT_TENANT.
     //     Hard-aborting here would deadlock workloads whose kernels start
-    //     before policyd has finished tenant registration.
+    //     before policyd has finished tenant registration. We also bump a
+    //     counter so callers (benchmarks, policyd) can detect this race.
     uint32_t regMask = registeredMask_.load(std::memory_order_acquire);
     if (regMask != 0 && (regMask & (uint32_t{1} << tid)) == 0) {
+      unregisteredCount_.fetch_add(1, std::memory_order_relaxed);
       // Rate-limit warning to avoid log floods.
       auto now = std::chrono::steady_clock::now();
       if (now - lastUnregisteredWarnAt_ >= std::chrono::seconds(1)) {
@@ -208,16 +213,20 @@ class TenantAwareProxyHandler {
         queuesEmpty = allQueuesEmptyLocked();
       }
       if (queuesEmpty) {
-        return inner_(trig);
+        // Bypass: pass the ORIGINAL ctx (poll-time fifoPos) straight through.
+        return inner_(trig, ctx);
       }
     }
 
     // (5) Slow path: enqueue with monotonic sequence + connection key, drain.
+    //     CRITICAL: the PendingTrigger stores the *push-time* fifoPos from
+    //     ctx, NOT a fresh fifo->tail() — that's the whole point of the
+    //     ContextProxyHandler ABI (design.md §5.7).
     {
       std::lock_guard<std::mutex> g(mu_);
       uint64_t seq = nextSeq_++;
       uint32_t connKey = static_cast<uint32_t>(trig.fields.semaphoreId);
-      queues_[tid].push_back(PendingTrigger{trig, seq, connKey});
+      queues_[tid].push_back(PendingTrigger{trig, seq, connKey, ctx});
       // Per-connection arrival order: this seq is now the youngest pending
       // trigger on connKey. The matching pop happens in drain() once this
       // trigger is actually dispatched.
@@ -235,11 +244,28 @@ class TenantAwareProxyHandler {
     return n;
   }
 
+  /// Test-only: enqueue a trigger WITHOUT draining. Lets a unit test
+  /// stockpile triggers so the DRR / aging / per-conn ordering paths can be
+  /// exercised against a non-trivial queue state — in production the proxy
+  /// thread always calls operator() which drains immediately after enqueue,
+  /// so synchronous unit tests can't naturally see deep queues.
+  void enqueueForTest(ProxyTrigger trig, ProxyFifoContext ctx) {
+    uint32_t tid = static_cast<uint32_t>(trig.fields.tenantId);
+    if (tid >= MAX_TENANTS) tid = static_cast<uint32_t>(DEFAULT_TENANT);
+    activeMask_.fetch_or(uint32_t{1} << tid, std::memory_order_acq_rel);
+    std::lock_guard<std::mutex> g(mu_);
+    uint64_t seq = nextSeq_++;
+    uint32_t connKey = static_cast<uint32_t>(trig.fields.semaphoreId);
+    queues_[tid].push_back(PendingTrigger{trig, seq, connKey, ctx});
+    connQueues_[connKey].push_back(seq);
+  }
+
  private:
   struct PendingTrigger {
-    ProxyTrigger trigger;
-    uint64_t     seq;          // monotonic enqueue order (proxy.cc polls FIFO in order)
-    uint32_t     connKey;      // semaphoreId — same PortChannel shares one proxy sem
+    ProxyTrigger     trigger;
+    uint64_t         seq;       // monotonic enqueue order (proxy.cc polls FIFO in order)
+    uint32_t         connKey;   // semaphoreId — same PortChannel shares one proxy sem
+    ProxyFifoContext ctx;       // PUSH-time fifoPos + enqueueNs (design.md §5.7)
   };
 
   ProxyHandlerResult drain() {
@@ -273,8 +299,11 @@ class TenantAwareProxyHandler {
         cq.pop_front();
       }
     }
-    // Outside the queue lock: process the trigger.
-    return inner_(picked.trigger);
+    // Outside the queue lock: dispatch with the ORIGINAL push-time context.
+    // This is the v0.2.1 invariant: TriggerSync flush boundaries follow the
+    // push-time fifoPos, not the dispatch-time tail (which has advanced by
+    // however many triggers were polled while this one waited in queue).
+    return inner_(picked.trigger, picked.ctx);
   }
 
   // Caller must hold mu_. True iff every tenant queue is empty.
@@ -296,8 +325,37 @@ class TenantAwareProxyHandler {
     return it->second.front() == head.seq;
   }
 
+  // Caller must hold mu_. Returns the trigger size encoded in fst's low bits.
+  static uint64_t headSize(const PendingTrigger& p) {
+    return static_cast<uint64_t>(p.trigger.fst & ((uint64_t{1} << TriggerBitsSize) - 1));
+  }
+
+  // Caller must hold mu_. DRR quantum per tenant in bytes — see design.md §5.3.1.
+  // Quantum × weight is the per-round credit; small enough that long messages
+  // span multiple rounds (which is how weight ratios kick in for hetero loads),
+  // large enough that pure-small-message workloads don't churn.
+  static constexpr uint64_t kDrrQuantumBytes = 64 * 1024;  // 64 KiB
+
+  // Aging threshold for StrictPriority — design.md §5.4.1 specifies 100 ms.
+  // After this many ns, a queued trigger's effective priority is boosted by
+  // one level per threshold elapsed, capped at the top QoS class. Aging is
+  // ONLY about preventing starvation; it never demotes anything.
+  static constexpr uint64_t kAgingThresholdNs = 100ULL * 1000ULL * 1000ULL;  // 100 ms
+
+  static uint64_t monoNowNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+  }
+
   // Caller must hold mu_. Apply the configured PolicyMode but only consider
   // tenants whose queue head is currently eligible per-connection.
+  //
+  // Side-effects on Fair / Hybrid path: may credit `deficit_[t] += quantum`
+  // for one or more tenants in order to find a candidate. This is correct DRR
+  // semantics — a tenant that didn't get credited last round will receive its
+  // share once a candidate is found.
   uint32_t pickNextLocked() {
     switch (mode_) {
       case PolicyMode::SinglePassthrough:
@@ -305,46 +363,169 @@ class TenantAwareProxyHandler {
           if (tenantHeadEligibleLocked(t)) return t;
         return MAX_TENANTS;
 
-      case PolicyMode::StrictPriority: {
-        uint32_t best = MAX_TENANTS;
-        int bestPri = -1;
-        for (uint32_t t = 0; t < MAX_TENANTS; ++t) {
-          if (!tenantHeadEligibleLocked(t)) continue;
-          int pri = static_cast<int>(tenants_[t].qos_class);
-          if (pri > bestPri) {
-            bestPri = pri;
-            best = t;
-          }
-        }
-        return best;
-      }
+      case PolicyMode::StrictPriority:
+        return pickStrictPriorityLocked();
 
       case PolicyMode::Hybrid: {
-        // Premium / Realtime first; otherwise DRR.
-        for (uint32_t t = 0; t < MAX_TENANTS; ++t) {
-          if (!tenantHeadEligibleLocked(t)) continue;
-          if (tenants_[t].qos_class >= QoSClass::Premium) return t;
-        }
-        // fall through
-        [[fallthrough]];
+        // Premium / Realtime first (with aging), otherwise fall through to DRR.
+        uint32_t premium = pickStrictPriorityLocked(/*minClass=*/QoSClass::Premium);
+        if (premium < MAX_TENANTS) return premium;
+        return pickDrrLocked();
       }
-      case PolicyMode::Fair: {
-        // Simple round-robin among eligible queues; weight applied via
-        // deficit counter would go here in a richer impl.
-        for (uint32_t step = 0; step < MAX_TENANTS; ++step) {
-          uint32_t t = (rrCursor_ + step) % MAX_TENANTS;
-          if (tenantHeadEligibleLocked(t)) {
-            rrCursor_ = (t + 1) % MAX_TENANTS;
-            return t;
-          }
-        }
-        return MAX_TENANTS;
-      }
+
+      case PolicyMode::Fair:
+        return pickDrrLocked();
     }
     return MAX_TENANTS;
   }
 
-  ProxyHandler inner_;
+  // StrictPriority with aging.
+  // - minClass (default BestEffort) lets Hybrid restrict the search to
+  //   Premium/Realtime tenants.
+  // - Aging promotes a tenant's effective QoS class by 1 per kAgingThresholdNs
+  //   the head trigger has been queued, capped at Realtime.
+  // - Eligible only when the head is at the front of its connection queue
+  //   (design.md §5.7.1).
+  uint32_t pickStrictPriorityLocked(QoSClass minClass = QoSClass::BestEffort) {
+    uint32_t best = MAX_TENANTS;
+    int bestEffPri = -1;
+    uint64_t now = monoNowNs();
+    for (uint32_t t = 0; t < MAX_TENANTS; ++t) {
+      if (!tenantHeadEligibleLocked(t)) continue;
+      int basePri = static_cast<int>(tenants_[t].qos_class);
+      if (basePri < static_cast<int>(minClass)) continue;
+
+      // Aging boost based on the OLDEST queued trigger for this tenant
+      // (= queue head, since we enqueue in arrival order).
+      uint64_t enqueueNs = queues_[t].front().ctx.enqueueNs;
+      int agedBoost = 0;
+      if (enqueueNs != 0 && now > enqueueNs) {
+        uint64_t waitNs = now - enqueueNs;
+        if (waitNs >= kAgingThresholdNs) {
+          agedBoost = static_cast<int>(waitNs / kAgingThresholdNs);
+        }
+      }
+      // Cap effective priority at the top class.
+      constexpr int kMaxQosLevel = static_cast<int>(QoSClass::Realtime);
+      int effPri = std::min(basePri + agedBoost, kMaxQosLevel);
+
+      if (effPri > bestEffPri) {
+        bestEffPri = effPri;
+        best = t;
+      }
+    }
+    return best;
+  }
+
+  // Real DRR (Deficit Round Robin) — design.md §5.3.1.
+  //
+  // Classic DRR is STICKY per tenant: once a tenant's turn starts, the
+  // scheduler keeps dispatching from that tenant as long as its deficit
+  // covers the head message. Only when the head no longer fits does the
+  // turn end and we advance to the next eligible tenant (who is then
+  // credited `weight × quantum` fresh).
+  //
+  // This is what makes weight ratios actually translate to bandwidth ratios
+  // for identical-size messages: tenant with weight=3 drains ~3× as many
+  // messages per turn as a tenant with weight=1.
+  //
+  // State carried across calls: `drrCurrent_` (-1 = no active turn) and
+  // `deficit_[]`. Each pickDrrLocked returns the current tenant if it can
+  // still afford its head; otherwise advances.
+  uint32_t pickDrrLocked() {
+    // Helper: does tenant t currently have a head whose size fits in deficit?
+    auto canServe = [this](uint32_t t) -> bool {
+      if (!tenantHeadEligibleLocked(t)) return false;
+      return deficit_[t] >= static_cast<int64_t>(headSize(queues_[t].front()));
+    };
+
+    // Phase 1: if there's an active turn (drrCurrent_) and that tenant can
+    // still afford its head, stay on them.
+    if (drrCurrent_ < MAX_TENANTS && canServe(drrCurrent_)) {
+      uint32_t t = drrCurrent_;
+      deficit_[t] -= static_cast<int64_t>(headSize(queues_[t].front()));
+      return t;
+    }
+
+    // Phase 2: current tenant's turn is over (queue empty, or deficit < head
+    // size). Advance to the next eligible tenant. We may need to "skip" non-
+    // eligible tenants and credit candidates multiple rounds if message sizes
+    // outsize quantum × weight. Bounded by kMaxCreditRounds to handle big
+    // outlier messages.
+    static constexpr int kMaxCreditRounds = 64;
+    uint32_t startCursor = (drrCurrent_ < MAX_TENANTS) ? ((drrCurrent_ + 1) % MAX_TENANTS) : drrCursor_;
+
+    for (int round = 0; round < kMaxCreditRounds; ++round) {
+      // Walk tenants in round-robin from startCursor.
+      for (uint32_t step = 0; step < MAX_TENANTS; ++step) {
+        uint32_t t = (startCursor + step) % MAX_TENANTS;
+        if (!tenantHeadEligibleLocked(t)) continue;
+        // Start a new turn for t: credit them weight × quantum.
+        // (Credit happens exactly once per turn; the deficit carries over
+        //  any leftover from previous turns so long-term fairness holds.)
+        uint64_t w = tenants_[t].weight ? tenants_[t].weight : 1;
+        deficit_[t] += static_cast<int64_t>(w * kDrrQuantumBytes);
+        if (canServe(t)) {
+          drrCurrent_ = t;
+          drrCursor_ = (t + 1) % MAX_TENANTS;
+          deficit_[t] -= static_cast<int64_t>(headSize(queues_[t].front()));
+          return t;
+        }
+        // Credit didn't cover — tenant t's head is bigger than weight×quantum.
+        // Keep iterating; the next round will credit them again, but try
+        // others first (in case someone smaller can be served).
+      }
+      // Nothing served this scan. If at least one tenant had eligible work
+      // (handled by the credit loop above), keep iterating so deficits grow
+      // big enough to cover their head.
+    }
+
+    // Escape hatch: outlier message larger than 64 × max(weight) × quantum.
+    // Pick any eligible tenant unconditionally; don't let deficit grow
+    // without bound — clamp to 0 here.
+    for (uint32_t step = 0; step < MAX_TENANTS; ++step) {
+      uint32_t t = (startCursor + step) % MAX_TENANTS;
+      if (tenantHeadEligibleLocked(t)) {
+        drrCurrent_ = t;
+        drrCursor_ = (t + 1) % MAX_TENANTS;
+        deficit_[t] = 0;
+        return t;
+      }
+    }
+    drrCurrent_ = MAX_TENANTS;
+    return MAX_TENANTS;
+  }
+
+ public:
+  /// MT-MSCCL++ (design.md §5.3.3 v0.2.1): progress hook called from the
+  /// proxy thread's progressHandler. Lets the scheduler retry dispatch
+  /// even when no new trigger has arrived — important when a tenant's
+  /// token bucket was dry and has since refilled, or when aging must
+  /// trigger a re-pick under sustained Realtime traffic.
+  /// Safe to call concurrently with operator() since both are invoked on
+  /// the single proxy thread.
+  void tickProgress() {
+    // Cheap fast path: no queued work.
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      if (allQueuesEmptyLocked()) return;
+    }
+    // Attempt one drain. drain() locks internally and dispatches at most
+    // one trigger; the proxy thread will keep calling tickProgress() each
+    // poll loop iteration.
+    drain();
+  }
+
+  /// Counter of how many triggers were observed with a tenantId that
+  /// wasn't in registeredMask_. Each such trigger is rewritten to
+  /// DEFAULT_TENANT (fail-open, design.md §5.5). Used by benchmarks /
+  /// policyd to detect that GPU kernels ran ahead of tenant registration.
+  uint64_t unregisteredTriggerCount() const {
+    return unregisteredCount_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  ContextProxyHandler inner_;
   std::atomic<uint32_t> activeMask_{0};
   std::atomic<uint32_t> registeredMask_{0};
   PolicyMode mode_;
@@ -356,8 +537,15 @@ class TenantAwareProxyHandler {
   std::array<TenantContext, MAX_TENANTS> tenants_{};
   std::array<BandwidthBudget, MAX_TENANTS> budgets_{};
   std::array<TokenBucket, MAX_TENANTS> buckets_{};
+  // DRR deficit (signed; can be temporarily negative after the escape hatch).
+  std::array<int64_t, MAX_TENANTS> deficit_{};
   uint64_t nextSeq_ = 0;
   uint32_t rrCursor_ = 0;
+  uint32_t drrCursor_ = 0;
+  // DRR active turn: which tenant currently "owns" the dispatch cursor.
+  // MAX_TENANTS sentinel = no active turn (idle).
+  uint32_t drrCurrent_ = MAX_TENANTS;
+  std::atomic<uint64_t> unregisteredCount_{0};
   std::chrono::steady_clock::time_point lastUnregisteredWarnAt_{};
 };
 
@@ -381,14 +569,25 @@ class TenantAwareProxyService : public ProxyService {
  public:
   TenantAwareProxyService(PolicyMode mode = PolicyMode::SinglePassthrough, int fifoSize = DEFAULT_FIFO_SIZE)
       : ProxyService(fifoSize),
-        handler_(std::make_shared<TenantAwareProxyHandler>(ProxyHandler{}, mode)) {
+        handler_(std::make_shared<TenantAwareProxyHandler>(ContextProxyHandler{}, mode)) {
     // The decorator captures handler_ (constructed BEFORE this lambda runs)
-    // and installs it as the proxy's outer handler.
+    // and installs it as the proxy's outer context-aware handler.
+    // Using setContextHandlerDecorator (not setHandlerDecorator) is what
+    // wires the push-time fifoPos through to the inner handleTrigger —
+    // see design.md §5.7 (v0.2.1) for why this matters.
     auto h = handler_;
-    setHandlerDecorator([h](ProxyHandler inner) {
+    setContextHandlerDecorator([h](ContextProxyHandler inner) {
       h->setInner(std::move(inner));
       return h->asHandler();
     });
+    // MT-MSCCL++ (design.md §5.3.3 v0.2.1): chain a tenant progress tick
+    // AFTER the base ProxyService::progressFlushes(). The proxy thread
+    // calls this every iteration of the poll loop, so a rate-limited
+    // tenant whose token bucket has just refilled (but no new trigger has
+    // arrived) still gets drained promptly instead of waiting for the
+    // next FIFO push. Same for aging-promoted BestEffort triggers — the
+    // tick re-evaluates priorities every loop.
+    setExtraProgressHook([h]() { h->tickProgress(); });
   }
 
   /// Register or update a tenant's policy and rate-limit budget. Thread-safe
@@ -407,6 +606,12 @@ class TenantAwareProxyService : public ProxyService {
 
   void setMode(PolicyMode mode) { handler_->setMode(mode); }
   PolicyMode mode() const { return handler_->mode(); }
+
+  /// MT-MSCCL++: total count of triggers that arrived with an unregistered
+  /// tenantId during this service's lifetime. Each was rewritten to
+  /// DEFAULT_TENANT (fail-open). > 0 indicates kernels ran ahead of policyd
+  /// registration; sustained growth is a deeper config bug.
+  uint64_t unregisteredTriggerCount() const { return handler_->unregisteredTriggerCount(); }
 
  private:
   std::shared_ptr<TenantAwareProxyHandler> handler_;

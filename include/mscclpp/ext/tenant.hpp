@@ -21,7 +21,7 @@ namespace tenant {
 using TenantId = uint8_t;
 
 constexpr TenantId DEFAULT_TENANT = 0;
-constexpr unsigned int MAX_TENANTS = 32;  // 5-bit tenant_id (design.md §5.2)
+constexpr unsigned int MAX_TENANTS = 16;  // 4-bit tenant_id (design.md §5.2, v0.2.1)
 
 enum class QoSClass : uint8_t {
   BestEffort = 0,
@@ -55,7 +55,8 @@ struct BandwidthBudget {
 
 struct PolicyTable {
   PolicyMode mode;
-  uint32_t   active_tenant_mask;
+  uint16_t   registered_tenant_mask;
+  uint16_t   active_tenant_mask;
   TenantContext   tenants[MAX_TENANTS];
   BandwidthBudget budgets[MAX_TENANTS];
   uint64_t  version;

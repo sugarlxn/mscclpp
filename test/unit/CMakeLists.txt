@@ -16,4 +16,5 @@ target_sources(unit_tests PRIVATE
     compile_tests.cu
     local_channel_tests.cu
     tenant_scheduler_tests.cc
+    proxy_trigger_layout_tests.cc
 )

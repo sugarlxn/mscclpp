@@ -25,6 +25,8 @@
 
 namespace {
 
+using mscclpp::ContextProxyHandler;
+using mscclpp::ProxyFifoContext;
 using mscclpp::ProxyHandler;
 using mscclpp::ProxyHandlerResult;
 using mscclpp::ProxyTrigger;
@@ -62,21 +64,32 @@ struct DispatchRecord {
 
 class Recorder {
  public:
-  ProxyHandler asHandler() {
-    return [this](ProxyTrigger t) -> ProxyHandlerResult {
+  ContextProxyHandler asHandler() {
+    return [this](ProxyTrigger t, ProxyFifoContext ctx) -> ProxyHandlerResult {
       records_.push_back(DispatchRecord{
           static_cast<uint32_t>(t.fields.tenantId),
           static_cast<uint32_t>(t.fields.semaphoreId),
           static_cast<uint32_t>(t.fields.type),
       });
+      lastCtx_ = ctx;
       return ProxyHandlerResult::Continue;
     };
   }
   const std::vector<DispatchRecord>& records() const { return records_; }
+  ProxyFifoContext lastCtx() const { return lastCtx_; }
 
  private:
   std::vector<DispatchRecord> records_;
+  ProxyFifoContext lastCtx_{};
 };
+
+// Helper: build a ProxyFifoContext with a synthetic fifoPos for testing.
+inline ProxyFifoContext makeCtx(uint64_t fifoPos) {
+  ProxyFifoContext c{};
+  c.fifoPos = fifoPos;
+  c.enqueueNs = fifoPos;  // not significant for these tests
+  return c;
+}
 
 }  // namespace
 
@@ -89,33 +102,28 @@ class Recorder {
 TEST(TenantSchedulerDispatchOrderTest, FirstTriggerFromNewTenantIsNotBypassedWithoutActiveMaskUpdate) {
   Recorder rec;
   TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  uint64_t pos = 100;
+  auto P = [&](uint32_t tid, uint32_t sem, uint32_t type) {
+    return h(makeTrigger(tid, sem, type), makeCtx(pos++));
+  };
 
-  // Register tenants 1 and 2.
-  h.updateTenant({/*tenant_id=*/1, QoSClass::Standard, 1, 0, 0, 0, 0},
-                 {/*bytes_per_second=*/0, /*burst_bytes=*/0, 0});
-  h.updateTenant({/*tenant_id=*/2, QoSClass::Standard, 1, 0, 0, 0, 0},
-                 {/*bytes_per_second=*/0, /*burst_bytes=*/0, 0});
+  h.updateTenant({/*tenant_id=*/1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
+  h.updateTenant({/*tenant_id=*/2, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
 
   // T1 sends two triggers — both should bypass (single active tenant + queues empty).
-  h(makeTrigger(/*tid=*/1, /*sem=*/0, TriggerData));
-  h(makeTrigger(/*tid=*/1, /*sem=*/0, TriggerData));
+  P(1, 0, TriggerData);
+  P(1, 0, TriggerData);
   ASSERT_EQ(rec.records().size(), 2u);
   EXPECT_EQ(rec.records()[0].tenantId, 1u);
   EXPECT_EQ(rec.records()[1].tenantId, 1u);
 
   // T2 sends its first trigger. With the bug, this would still be bypassed.
-  // With the fix, activeMask becomes {1, 2}, popcount==2, slow path engages.
-  h(makeTrigger(/*tid=*/2, /*sem=*/0, TriggerData));
-  // The trigger should have reached inner_ (via drain → pickNext), but more
-  // importantly, T2 must now be tracked. Subsequent triggers from T2 must
-  // never silently bypass back.
+  P(2, 0, TriggerData);
   ASSERT_EQ(rec.records().size(), 3u);
   EXPECT_EQ(rec.records()[2].tenantId, 2u);
 
-  // Re-confirm: another T1 trigger now goes through the scheduler (not bypass)
-  // because activeMask has both bits set. We can't observe "took slow path"
-  // directly, but we can verify the ordering invariant still holds.
-  h(makeTrigger(/*tid=*/1, /*sem=*/0, TriggerData));
+  // Subsequent T1 trigger must NOT silently bypass — activeMask has both bits.
+  P(1, 0, TriggerData);
   ASSERT_EQ(rec.records().size(), 4u);
 }
 
@@ -128,27 +136,25 @@ TEST(TenantSchedulerDispatchOrderTest, FirstTriggerFromNewTenantIsNotBypassedWit
 TEST(TenantSchedulerPerConnOrderingTest, SameConnectionFifoPreservedAcrossTenants) {
   Recorder rec;
   TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  uint64_t pos = 10;
+  auto P = [&](uint32_t tid, uint32_t sem, uint32_t type) {
+    return h(makeTrigger(tid, sem, type), makeCtx(pos++));
+  };
 
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
 
-  // Push three triggers, all on semaphoreId=7, arrival order D1 -> S2 -> D1':
-  //   - D1  : Data,  tenant 1, sem 7
-  //   - S2  : Sync,  tenant 2, sem 7  (must NOT pass D1)
-  //   - D1' : Data,  tenant 1, sem 7  (must NOT pass S2)
-  h(makeTrigger(/*tid=*/1, /*sem=*/7, TriggerData));
-  h(makeTrigger(/*tid=*/2, /*sem=*/7, TriggerSync));
-  h(makeTrigger(/*tid=*/1, /*sem=*/7, TriggerData));
+  // Three triggers all on semaphoreId=7, arrival order D1 -> S2 -> D1'.
+  // S2 (tenant 2) must NOT pass D1 (tenant 1) even though it's a different queue.
+  P(1, 7, TriggerData);  // pos = 10
+  P(2, 7, TriggerSync);  // pos = 11
+  P(1, 7, TriggerData);  // pos = 12
 
-  // Drive drain repeatedly via cheap no-op triggers on an isolated key (sem 8)
-  // to flush the pending queue. Each operator() call drains at most one
-  // trigger, so just call it a few times. Use a different conn key so we
-  // don't muddle the assertion.
+  // Drive drain with cheap triggers on an isolated key.
   for (int i = 0; i < 6; ++i) {
-    h(makeTrigger(/*tid=*/1, /*sem=*/8, TriggerData));
+    P(1, 8, TriggerData);
   }
 
-  // Filter only sem=7 triggers in dispatch order.
   std::vector<uint32_t> seq;
   for (auto& r : rec.records()) {
     if (r.semaphoreId == 7) seq.push_back(r.type);
@@ -167,24 +173,21 @@ TEST(TenantSchedulerPerConnOrderingTest, SameConnectionFifoPreservedAcrossTenant
 TEST(TenantSchedulerPerConnOrderingTest, DifferentConnectionsMayReorder) {
   Recorder rec;
   TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority);
+  uint64_t pos = 200;
+  auto P = [&](uint32_t tid, uint32_t sem, uint32_t type) {
+    return h(makeTrigger(tid, sem, type), makeCtx(pos++));
+  };
 
   h.updateTenant({1, QoSClass::BestEffort, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::Realtime, 1, 0, 0, 0, 0}, {0, 0, 0});
 
-  // D on tenant 1 / sem 1 arrives first, but tenant 2 has Realtime priority,
-  // so under StrictPriority its trigger (different sem) is allowed to be
-  // dispatched first. The invariant only forbids reorder WITHIN the same sem.
-  h(makeTrigger(/*tid=*/1, /*sem=*/1, TriggerData));
-  h(makeTrigger(/*tid=*/2, /*sem=*/2, TriggerData));
+  P(1, 1, TriggerData);
+  P(2, 2, TriggerData);
 
-  // Drain.
   for (int i = 0; i < 4; ++i) {
-    h(makeTrigger(/*tid=*/2, /*sem=*/3, TriggerData));  // priming triggers on key 3
+    P(2, 3, TriggerData);
   }
 
-  // We don't pin a specific order across (sem=1, sem=2) — only that BOTH
-  // eventually appear, and they don't violate same-conn ordering (trivially
-  // satisfied because each has a unique key).
   bool sawSem1 = false, sawSem2 = false;
   for (auto& r : rec.records()) {
     if (r.semaphoreId == 1) sawSem1 = true;
@@ -203,23 +206,19 @@ TEST(TenantSchedulerPerConnOrderingTest, DifferentConnectionsMayReorder) {
 TEST(TenantSchedulerFailOpenTest, UnregisteredTenantReattributedToDefault) {
   Recorder rec;
   TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  uint64_t pos = 300;
+  auto P = [&](uint32_t tid, uint32_t sem, uint32_t type) {
+    return h(makeTrigger(tid, sem, type), makeCtx(pos++));
+  };
 
-  // Register tenant 1 only. Default tenant (0) is implicit.
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
 
   // Tenant 5 is NOT registered — should fail-open to DEFAULT_TENANT (=0).
-  // We can't directly observe the rewrite (the trigger struct is consumed
-  // by inner_), but we CAN verify:
-  //   - the trigger is delivered (not dropped),
-  //   - it bypasses or enqueues correctly under DEFAULT_TENANT accounting.
-  h(makeTrigger(/*tid=*/5, /*sem=*/0, TriggerData));
+  P(5, 0, TriggerData);
   ASSERT_EQ(rec.records().size(), 1u);
 
-  // Now register tenant 5 properly and send again — should not warn / not be
-  // rewritten. The handler does not expose tenantId post-dispatch, so we just
-  // check delivery succeeds and didn't crash.
   h.updateTenant({5, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
-  h(makeTrigger(/*tid=*/5, /*sem=*/0, TriggerData));
+  P(5, 0, TriggerData);
   ASSERT_EQ(rec.records().size(), 2u);
 }
 
@@ -229,26 +228,68 @@ TEST(TenantSchedulerFailOpenTest, UnregisteredTenantReattributedToDefault) {
 // must drain its existing queue first to avoid reordering trigger N+1 (just
 // arrived, would bypass) past trigger N (still in queue from earlier).
 TEST(TenantSchedulerBypassTest, DoesNotBypassWhilePendingQueueIsNonEmpty) {
-  // Hold the inner handler open via a non-trivial body so we can observe.
   Recorder rec;
   TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  uint64_t pos = 400;
+  auto P = [&](uint32_t tid, uint32_t sem, uint32_t type) {
+    return h(makeTrigger(tid, sem, type), makeCtx(pos++));
+  };
 
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
 
-  // Make both tenants active.
-  h(makeTrigger(/*tid=*/1, /*sem=*/0, TriggerData));
-  h(makeTrigger(/*tid=*/2, /*sem=*/0, TriggerData));
-  // After these, both bits are set in activeMask. There may be 0 or 1 pending
-  // depending on drain order. We don't care; just confirm no crash.
+  P(1, 0, TriggerData);
+  P(2, 0, TriggerData);
   EXPECT_GE(rec.records().size(), 1u);
 
-  // Force a state where queue is non-empty: enqueue many triggers; each
-  // operator() call drains at most one, so a burst leaves residue.
   for (int i = 0; i < 10; ++i) {
-    h(makeTrigger(/*tid=*/(i % 2) + 1, /*sem=*/0, TriggerData));
+    P((i % 2) + 1, 0, TriggerData);
   }
-  // Some triggers may still be pending — pendingCountForTest is non-decreasing
-  // across this burst then drained on subsequent calls. Just sanity check:
   EXPECT_LE(h.pendingCountForTest(), 11u);
+}
+
+// -------- 6) TriggerSync flush boundary uses push-time fifoPos (design.md §5.7).
+//
+// Regression for the iter5 P1 bug: when the scheduler delays dispatch, the
+// inner handler must see the ORIGINAL push-time fifoPos, not the proxy's
+// current tail() which has advanced by however many triggers were polled
+// while this one waited in queue.
+TEST(TriggerSyncFifoPosTest, DispatchedCtxMatchesPushTimePos) {
+  // The Recorder remembers the ctx of the LAST trigger dispatched. We push
+  // a tagged TriggerSync at fifoPos=999, then several Data triggers behind
+  // it. Under Fair scheduling the order between tenants may interleave, but
+  // when the Sync is eventually dispatched its ctx.fifoPos MUST be 999, not
+  // some later value.
+  struct PerCallRecorder {
+    std::vector<ProxyFifoContext> ctxs;
+    ContextProxyHandler asHandler() {
+      return [this](ProxyTrigger, ProxyFifoContext c) {
+        ctxs.push_back(c);
+        return ProxyHandlerResult::Continue;
+      };
+    }
+  } rec;
+
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
+  h.updateTenant({2, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
+
+  // Manually drive: TriggerSync at pos 999 from tenant 1; then 5 Data from
+  // tenant 2 at later positions. The scheduler may interleave on dispatch,
+  // but the ORIGINAL fifoPos for each must round-trip exactly.
+  h(makeTrigger(/*tid=*/1, /*sem=*/0, TriggerSync), makeCtx(999));
+  for (uint64_t p = 1000; p < 1005; ++p) {
+    h(makeTrigger(/*tid=*/2, /*sem=*/0, TriggerData), makeCtx(p));
+  }
+
+  // Find the dispatch that corresponds to the Sync — the only one with
+  // fifoPos == 999.
+  bool sawSyncCtx = false;
+  for (auto& c : rec.ctxs) {
+    if (c.fifoPos == 999) sawSyncCtx = true;
+    // No ctx may be a stale/fresh tail() value — they must come from the set
+    // {999, 1000, 1001, 1002, 1003, 1004}.
+    EXPECT_TRUE(c.fifoPos == 999 || (c.fifoPos >= 1000 && c.fifoPos <= 1004));
+  }
+  EXPECT_TRUE(sawSyncCtx);
 }

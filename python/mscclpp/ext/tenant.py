@@ -29,7 +29,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Callable, Optional
 
 
-MAX_TENANTS = 32
+MAX_TENANTS = 16   # 4-bit tenant_id (design.md §5.2, v0.2.1)
 DEFAULT_TENANT = 0
 DEFAULT_QUANTUM_BYTES = 64 * 1024     # WFQ service quantum (design.md §5.3.1)
 DEFAULT_AGING_MS = 100                # Priority aging threshold (design.md §5.4.1)

@@ -24,13 +24,16 @@ constexpr unsigned int TriggerBitsSize = 32;
 constexpr unsigned int TriggerBitsOffset = 32;
 constexpr unsigned int TriggerBitsMemoryId = 9;
 constexpr unsigned int TriggerBitsType = 3;
-// MT-MSCCL++ (design.md §5.2): borrow 4 bits from semaphoreId and the 1
-// reserved bit to make room for a 5-bit tenant_id. The 6-bit semaphoreId still
-// supports up to 64 semaphores per ProxyService, which is the practical limit
-// (peers × concurrent collectives ≤ 8 × 8 = 64 in a single communicator).
+// MT-MSCCL++ (design.md §5.2, v0.2.1): 4-bit tenant_id + 6-bit semaphoreId +
+// 1 MSB reserved for the FIFO's push() XOR (see fifo.cc / proxy.cc — the host
+// ready/empty check is fst != 0 && snd != 0, and the MSB flip exists to ensure
+// snd != 0 after push). Business fields must NOT touch bit 63.
+//   - tenant_id: 0..15 (0 reserved for DEFAULT_TENANT, see ext/tenant.hpp)
+//   - semaphoreId: 0..63 (per ProxyService lifecycle hard cap; see
+//                          port_channel.cc ProxyService::addSemaphore guard)
 constexpr unsigned int TriggerBitsSemaphoreId = 6;
-constexpr unsigned int TriggerBitsTenantId = 5;
-constexpr unsigned int TriggerBitsFifoReserved = 0;
+constexpr unsigned int TriggerBitsTenantId = 4;
+constexpr unsigned int TriggerBitsFifoReserved = 1;
 
 /// Pair of 64-bit unsigned integers used as a trigger for the proxy.
 /// Used as a work element in the concurrent FIFO.
@@ -46,13 +49,15 @@ union alignas(16) ProxyTrigger {
     uint64_t size : TriggerBitsSize;
     uint64_t srcOffset : TriggerBitsOffset;
     uint64_t : (64 - TriggerBitsSize - TriggerBitsOffset);  // ensure 64-bit alignment
-    // Second 64 bits: value[1]
-    uint64_t dstOffset : TriggerBitsOffset;
-    uint64_t srcMemoryId : TriggerBitsMemoryId;
-    uint64_t dstMemoryId : TriggerBitsMemoryId;
-    uint64_t type : TriggerBitsType;
-    uint64_t tenantId : TriggerBitsTenantId;        // MT-MSCCL++ tenant_id (5 bits, 0..31)
-    uint64_t semaphoreId : TriggerBitsSemaphoreId;  // shrunk from 10 → 6 bits
+    // Second 64 bits: value[1] — low→high order MUST match the explicit
+    // shift/mask encoder in the ctor below.
+    uint64_t dstOffset : TriggerBitsOffset;         // bits 0..31
+    uint64_t srcMemoryId : TriggerBitsMemoryId;     // bits 32..40
+    uint64_t dstMemoryId : TriggerBitsMemoryId;     // bits 41..49
+    uint64_t type : TriggerBitsType;                // bits 50..52
+    uint64_t tenantId : TriggerBitsTenantId;        // bits 53..56  (MT-MSCCL++ v0.2.1: 4 bits, 0..15)
+    uint64_t semaphoreId : TriggerBitsSemaphoreId;  // bits 57..62  (shrunk from 10 → 6 bits)
+    uint64_t : TriggerBitsFifoReserved;             // bit 63 — FIFO reserved for push() XOR
   } fields;
 
 #if defined(MSCCLPP_DEVICE_COMPILE)
@@ -67,7 +72,7 @@ union alignas(16) ProxyTrigger {
   /// @param srcOffset The offset into the source memory region.
   /// @param bytes The bytes of the transfer.
   /// @param semaphoreId The ID of the semaphore (0..63 after MT-MSCCL++ bitfield change).
-  /// @param tenantId  MT-MSCCL++ tenant ID (0..31); defaults to 0 for legacy callers.
+  /// @param tenantId  MT-MSCCL++ tenant ID (0..15, design v0.2.1); defaults to 0 for legacy callers.
   MSCCLPP_DEVICE_INLINE ProxyTrigger(TriggerType type, uint32_t dstId, uint64_t dstOffset, uint32_t srcId,
                                      uint64_t srcOffset, uint64_t bytes, uint32_t semaphoreId,
                                      uint32_t tenantId = 0) {
@@ -89,7 +94,12 @@ union alignas(16) ProxyTrigger {
     constexpr uint64_t maskSemaphoreId = (1ULL << TriggerBitsSemaphoreId) - 1;
     constexpr uint64_t maskTenantId = (1ULL << TriggerBitsTenantId) - 1;
     fst = (((srcOffset & maskSrcOffset) << TriggerBitsSize) + (bytes & maskSize));
-    // Layout (low → high): dstOffset(32) | srcMemId(9) | dstMemId(9) | type(3) | tenantId(5) | semId(6)
+    // Layout (low → high):
+    //   dstOffset(32) | srcMemId(9) | dstMemId(9) | type(3) | tenantId(4) | semId(6) | reserved(1)
+    // The reserved bit MUST stay 0 here — host-side FifoDeviceHandle::push() flips
+    // bit 63 to guarantee snd != 0 (see fifo_device.hpp::push and proxy.cc ready
+    // check). Any encoder of ProxyTrigger MUST keep bit 63 clear; the encode/decode
+    // unit test (test/unit/proxy_trigger_layout_tests.cc) verifies this invariant.
     snd = (((((((((((semaphoreId & maskSemaphoreId) << TriggerBitsTenantId) +
                    (tenantId & maskTenantId))
                   << TriggerBitsType) +

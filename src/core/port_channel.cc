@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#include <mscclpp/errors.hpp>
+#include <mscclpp/fifo_device.hpp>
 #include <mscclpp/numa.hpp>
 #include <mscclpp/port_channel.hpp>
 
@@ -11,6 +13,26 @@
 #include "proxy_impl.hpp"
 
 namespace mscclpp {
+
+namespace {
+// MT-MSCCL++ (design.md §5.2, v0.2.1): host-side guards mirroring the
+// ProxyTrigger bit-field widths in fifo_device.hpp. Hard-throw on overflow
+// rather than silent truncation — iter4 lost a day to a silent semId
+// wrap that signalled the wrong semaphore and hung the GPU.
+constexpr size_t kMaxSemaphoresPerProxy = 1ULL << TriggerBitsSemaphoreId;   // 64
+constexpr size_t kMaxMemoriesPerProxy   = 1ULL << TriggerBitsMemoryId;      // 512
+constexpr uint32_t kMaxTenantId         = (1U << TriggerBitsTenantId) - 1; // 15
+}  // namespace
+
+MSCCLPP_API_CPP void BasePortChannel::setTenantId(uint32_t tenantId) {
+  if (tenantId > kMaxTenantId) {
+    throw Error("BasePortChannel::setTenantId(" + std::to_string(tenantId) +
+                    ") out of range; tenant_id is " + std::to_string(TriggerBitsTenantId) +
+                    " bits (max " + std::to_string(kMaxTenantId) + ").",
+                ErrorCode::InvalidUsage);
+  }
+  tenantId_ = tenantId;
+}
 
 MSCCLPP_API_CPP BasePortChannel::BasePortChannel(SemaphoreId semaphoreId,
                                                  std::shared_ptr<Host2DeviceSemaphore> semaphore,
@@ -40,28 +62,77 @@ MSCCLPP_API_CPP ProxyService::ProxyService(int fifoSize) {
       INFO(CONN, "NUMA node of ProxyService proxy thread is set to ", deviceNumaNode);
     }
   };
-  auto handlerFunc = [&](ProxyTrigger triggerRaw) { return handleTrigger(triggerRaw); };
+  // Legacy path kept for users who plug in a plain ProxyHandler decorator —
+  // for them we never see scheduler delay, so picking up the current tail()
+  // here is correct.
+  auto handlerFunc = [this](ProxyTrigger triggerRaw) {
+    ProxyFifoContext ctx{};
+    ctx.fifoPos = proxy_->fifo()->tail();
+    ctx.enqueueNs = 0;
+    return handleTrigger(triggerRaw, ctx);
+  };
   proxy_ = std::make_shared<Proxy>(handlerFunc, initFunc, fifoSize);
-  proxy_->pimpl_->setProgressHandler([this]() { progressFlushes(); });
+  // MT-MSCCL++ (design.md §5.7, v0.2.1): also install a context-aware
+  // handler so that the proxy thread can pass the poll-time fifoPos through
+  // to handleTrigger without a redundant tail() read. The proxy thread's
+  // start() prefers `contextHandler` over `handler` when both are set.
+  proxy_->pimpl_->setContextHandler(
+      [this](ProxyTrigger triggerRaw, ProxyFifoContext ctx) { return handleTrigger(triggerRaw, ctx); });
+  // Combined progress handler: built-in flush progress + optional extra hook
+  // installed via setExtraProgressHook() (used by TenantAwareProxyService for
+  // token-bucket retry / aging-aware re-pick — design.md §5.3.3 v0.2.1).
+  proxy_->pimpl_->setProgressHandler([this]() {
+    progressFlushes();
+    if (extraProgressHook_) extraProgressHook_();
+  });
+}
+
+MSCCLPP_API_CPP void ProxyService::setExtraProgressHook(std::function<void()> hook) {
+  // Stored on `this`; the proxy thread's progressHandler closure already
+  // captures `this` and tests for emptiness on each call (see ctor above).
+  extraProgressHook_ = std::move(hook);
 }
 
 MSCCLPP_API_CPP SemaphoreId ProxyService::buildAndAddSemaphore(Communicator& communicator,
                                                                const Connection& connection) {
+  if (semaphores_.size() >= kMaxSemaphoresPerProxy) {
+    throw Error(
+        "ProxyService::buildAndAddSemaphore would exceed the per-ProxyService semaphore cap "
+        "(" + std::to_string(kMaxSemaphoresPerProxy) + "). Recreate the ProxyService per "
+        "benchmark size, or use multiple ProxyService shards. See design.md §5.2 / §10.1.",
+        ErrorCode::InvalidUsage);
+  }
   semaphores_.push_back(std::make_shared<Host2DeviceSemaphore>(communicator, connection));
   return semaphores_.size() - 1;
 }
 
 MSCCLPP_API_CPP SemaphoreId ProxyService::addSemaphore(const Semaphore& semaphore) {
+  if (semaphores_.size() >= kMaxSemaphoresPerProxy) {
+    throw Error("ProxyService::addSemaphore would exceed the per-ProxyService semaphore cap (" +
+                    std::to_string(kMaxSemaphoresPerProxy) + ").",
+                ErrorCode::InvalidUsage);
+  }
   semaphores_.push_back(std::make_shared<Host2DeviceSemaphore>(semaphore));
   return semaphores_.size() - 1;
 }
 
 MSCCLPP_API_CPP SemaphoreId ProxyService::addSemaphore(std::shared_ptr<Host2DeviceSemaphore> semaphore) {
+  if (semaphores_.size() >= kMaxSemaphoresPerProxy) {
+    throw Error("ProxyService::addSemaphore would exceed the per-ProxyService semaphore cap (" +
+                    std::to_string(kMaxSemaphoresPerProxy) + ").",
+                ErrorCode::InvalidUsage);
+  }
   semaphores_.push_back(semaphore);
   return semaphores_.size() - 1;
 }
 
 MSCCLPP_API_CPP MemoryId ProxyService::addMemory(RegisteredMemory memory) {
+  if (memories_.size() >= kMaxMemoriesPerProxy) {
+    throw Error("ProxyService::addMemory would exceed the per-ProxyService memory cap (" +
+                    std::to_string(kMaxMemoriesPerProxy) +
+                    "). MemoryId is encoded in " + std::to_string(TriggerBitsMemoryId) + " bits.",
+                ErrorCode::InvalidUsage);
+  }
   memories_.push_back(memory);
   return memories_.size() - 1;
 }
@@ -88,10 +159,33 @@ MSCCLPP_API_CPP PortChannel ProxyService::portChannel(SemaphoreId id, MemoryId d
 
 MSCCLPP_API_CPP void ProxyService::setHandlerDecorator(ProxyHandlerDecorator decorator) {
   if (!decorator) return;
-  // The inner handler is our own handleTrigger; wrap it and hot-swap the
-  // proxy thread's handler before the thread starts.
-  ProxyHandler inner = [this](ProxyTrigger triggerRaw) { return handleTrigger(triggerRaw); };
+  // Legacy decorator path: the wrapped inner sees only the trigger, and
+  // reads tail() itself for fifoPos. This is OK only when the decorator
+  // does NOT delay dispatch — otherwise see setContextHandlerDecorator().
+  ProxyHandler inner = [this](ProxyTrigger triggerRaw) {
+    ProxyFifoContext ctx{};
+    ctx.fifoPos = proxy_->fifo()->tail();
+    ctx.enqueueNs = 0;
+    return handleTrigger(triggerRaw, ctx);
+  };
   proxy_->pimpl_->handler = decorator(std::move(inner));
+  // Disable the context handler — legacy decorator wins; the proxy thread's
+  // start() loop will fall through to `handler` because contextHandler is
+  // cleared.
+  proxy_->pimpl_->contextHandler = nullptr;
+}
+
+MSCCLPP_API_CPP void ProxyService::setContextHandlerDecorator(ContextProxyHandlerDecorator decorator) {
+  if (!decorator) return;
+  // Context-aware decorator path (design.md §5.7, v0.2.1). The inner takes
+  // both the trigger and its poll-time context, and the decorator may store
+  // the context (e.g. inside a PendingTrigger) and replay it later when it
+  // actually dispatches the trigger. handleTrigger receives `ctx` and uses
+  // ctx.fifoPos for TriggerSync flush boundaries instead of fifo->tail().
+  ContextProxyHandler inner = [this](ProxyTrigger triggerRaw, ProxyFifoContext ctx) {
+    return handleTrigger(triggerRaw, ctx);
+  };
+  proxy_->pimpl_->contextHandler = decorator(std::move(inner));
 }
 
 MSCCLPP_API_CPP void ProxyService::startProxy(bool blocking) { proxy_->start(blocking); }
@@ -112,11 +206,15 @@ MSCCLPP_API_CPP void ProxyService::stopProxy() {
   }
 }
 
-ProxyHandlerResult ProxyService::handleTrigger(ProxyTrigger trigger) {
-  // The proxy is the sole FIFO consumer and processes in strict push order, so the FIFO's
-  // tail (between poll() and pop()) matches the value GPU's fifo_.push() returned for this
-  // trigger — use it directly as our per-trigger sequence number.
-  uint64_t pos = proxy_->fifo()->tail();
+ProxyHandlerResult ProxyService::handleTrigger(ProxyTrigger trigger, ProxyFifoContext ctx) {
+  // MT-MSCCL++ (design.md §5.7, v0.2.1): use the caller-provided fifoPos.
+  // For the non-tenant path the proxy thread captured this at poll time
+  // (== tail() pre-pop). For the tenant-scheduled path, the scheduler
+  // captured it at enqueue time and is replaying it now, possibly long
+  // after fifo->tail() has advanced past this trigger's position.
+  // Falling back to tail() here would silently desync the flush boundary
+  // by exactly the scheduler's delay.
+  uint64_t pos = ctx.fifoPos;
 
   std::shared_ptr<Host2DeviceSemaphore> semaphore = semaphores_[trigger.fields.semaphoreId];
 

@@ -443,11 +443,23 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
                     time_us = ms_per_iter * 1000.0
                     bw = alg_bw_gbps(mem_bytes, time_us)
                     qos = qos_classes[tid - 1]
+                    # Iter5 honesty note: single-stream mode collapses all
+                    # tenant kernels onto one stream → tenants execute
+                    # serially in launch order. The C++ scheduler reorders
+                    # triggers in the proxy thread, but with only one
+                    # tenant's triggers in flight at any moment there's
+                    # nothing to reorder. So same-size per-tenant timings
+                    # are expected to converge. The "single_stream_smoke"
+                    # suffix flags this in downstream analysis so it isn't
+                    # mistaken for a fairness / priority isolation result.
+                    backend_label = f"mscclpp_cpp_mt_{mode.name.lower()}"
+                    if single_stream_mode:
+                        backend_label += "_single_stream_smoke"
                     results.append({
                         "run_id": run_id,
                         "timestamp": datetime.utcnow().isoformat(),
                         "scenario": scenario_name,
-                        "backend": f"mscclpp_cpp_mt_{mode.name.lower()}",
+                        "backend": backend_label,
                         "collective": "allreduce",
                         "tenant_id": tid,
                         "qos_class": qos.name,

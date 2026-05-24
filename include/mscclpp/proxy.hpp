@@ -4,6 +4,7 @@
 #ifndef MSCCLPP_PROXY_HPP_
 #define MSCCLPP_PROXY_HPP_
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 
@@ -24,6 +25,31 @@ class ProxyService;
 
 /// Handler function type for proxy. Called once per ready FIFO trigger.
 using ProxyHandler = std::function<ProxyHandlerResult(ProxyTrigger)>;
+
+/// MT-MSCCL++ (design.md §5.7, v0.2.1): metadata captured AT POLL TIME — i.e.
+/// before the proxy thread calls `pop()` and before any tenant scheduler may
+/// delay dispatch. This is the only reliable place to record the FIFO
+/// position that corresponds 1:1 with the device-side `prevHead` returned by
+/// `FifoDeviceHandle::push()`. After scheduler-induced delay, `fifo->tail()`
+/// is the position of some *later* trigger, so handlers that need true
+/// per-trigger ordering (TriggerSync flush boundary; per-connection FIFO)
+/// must take fifoPos from this struct, not from a fresh tail() read.
+struct ProxyFifoContext {
+  /// Monotonic FIFO position of this trigger as assigned by the GPU-side
+  /// push(). Equal to `fifo->tail()` at the moment the proxy thread polled
+  /// this trigger.
+  uint64_t fifoPos;
+  /// Host monotonic timestamp (ns) when the proxy thread observed this
+  /// trigger. Used by `TenantAwareProxyHandler` for aging / progress-hook
+  /// retries.
+  uint64_t enqueueNs;
+};
+
+/// Context-aware handler. Called once per ready FIFO trigger, passing both
+/// the trigger itself and its per-poll context. Preferred over `ProxyHandler`
+/// when downstream logic (e.g. tenant scheduling) may delay dispatch and
+/// therefore needs the original FIFO position.
+using ContextProxyHandler = std::function<ProxyHandlerResult(ProxyTrigger, ProxyFifoContext)>;
 
 /// Host-side proxy for PortChannels.
 class Proxy {
