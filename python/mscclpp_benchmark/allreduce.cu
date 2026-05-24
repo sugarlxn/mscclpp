@@ -12,6 +12,18 @@
 #include <mscclpp/port_channel_device.hpp>
 #include <mscclpp/switch_channel_device.hpp>
 
+// MT-MSCCL++ iter 6 TODO: these four file-scope `__device__` DeviceSyncers
+// are shared across ALL concurrent kernel launches that touch them. The
+// allreduce3 kernel was rewritten in iter 6 to take a per-instance
+// `DeviceSyncer*` parameter (see signature change below + the
+// MscclppAllReduce3 Python wrapper). The remaining algos — allreduce1/2/4/5
+// and a few helper kernels in this file — still use these globals. If a
+// future iter wants to run those algos concurrently across multiple streams
+// (K-streams path in MT scenarios), they will hit the SAME hang that iter 5
+// observed for allreduce3 (counter doubles past blockNum → grid-wide barrier
+// never resolves). The fix is the same per-instance-DeviceSyncer pattern;
+// leaving these as globals only because the MT path currently selects
+// allreduce3 exclusively (see assign_tenant_to_allreduce3 in run_bench.py).
 __device__ mscclpp::DeviceSyncer deviceSyncer;
 __device__ mscclpp::DeviceSyncer allGatherDeviceSyncer;
 __device__ mscclpp::DeviceSyncer reduceScatterDeviceSyncer;

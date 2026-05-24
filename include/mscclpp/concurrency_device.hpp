@@ -68,6 +68,18 @@ struct DeviceSyncer {
   unsigned int currentCountIdx_;
 };
 
+/// MT-MSCCL++ (iter 6): allocation size of a single DeviceSyncer in bytes.
+/// Used by Python wrappers (e.g. MscclppAllReduce3) to allocate per-instance
+/// zero-initialized GPU buffers without hardcoding the struct size. If
+/// DeviceSyncer's layout ever changes, the static_assert below catches the
+/// mismatch at compile time; downstream Python code reads this constant via
+/// a binding rather than assuming a literal value.
+static constexpr unsigned int DeviceSyncerSizeBytes =
+    sizeof(unsigned int) * DeviceSyncer::NumCounters + sizeof(unsigned int);
+static_assert(sizeof(DeviceSyncer) == DeviceSyncerSizeBytes,
+              "DeviceSyncer layout changed — update DeviceSyncerSizeBytes and the Python "
+              "MscclppAllReduce3._syncer_buffer allocation accordingly.");
+
 /// A device-wide semaphore.
 /// This semaphore can be used to control access to a resource across multiple threads or blocks.
 /// It uses atomic operations to ensure that the semaphore value is updated correctly across threads.

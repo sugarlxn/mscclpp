@@ -208,10 +208,17 @@ class MscclppAllReduce3:
         # MT-MSCCL++ iter 6: per-instance DeviceSyncer. The kernel was changed
         # to take a `DeviceSyncer*` parameter instead of the file-scope global,
         # so concurrent kernel launches on different streams don't share
-        # barrier counter state. sizeof(DeviceSyncer) = 3 × uint + 1 × uint
-        # = 16 bytes; allocate a small zero-initialized GPU buffer per instance.
-        # See include/mscclpp/concurrency_device.hpp for the struct.
-        self._syncer_buffer = cp.zeros(16, dtype=cp.uint8)
+        # barrier counter state. Allocate a zero-initialized GPU buffer of the
+        # exact struct size (queried at import time from the C++ side via the
+        # DEVICE_SYNCER_SIZE_BYTES constant — see python/csrc/utils_py.cpp +
+        # include/mscclpp/concurrency_device.hpp::DeviceSyncerSizeBytes).
+        # If the C++ layout ever changes, both ends adjust together.
+        try:
+            from mscclpp._mscclpp import DEVICE_SYNCER_SIZE_BYTES as _syncer_size
+        except ImportError:
+            # Fallback for older bindings: 3 × uint counters + 1 × uint index = 16 B.
+            _syncer_size = 16
+        self._syncer_buffer = cp.zeros(_syncer_size, dtype=cp.uint8)
 
         self.set_params(nblocks, block_size)
 

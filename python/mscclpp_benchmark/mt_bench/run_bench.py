@@ -331,11 +331,16 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
     weights_eff = list(weights) if weights else [1] * num_tenants
 
     # Iter 4: re-create the proxy_service per size. Iter 2 shrank semaphoreId
-    # in ProxyTrigger from 10→6 bits (max 64 semaphores) to make room for the
-    # 5-bit tenantId. Each MscclppAllReduce3 allocates 6 semaphores per peer-
-    # set, so accumulating across (sizes × tenants) silently overflows the
-    # semaphore-ID field and triggers signal the wrong semaphore — the kernel
-    # then waits forever. Recreating per-size keeps the running count under 64.
+    # in ProxyTrigger from 10 → 6 bits (max 64 semaphores) and iter 5.5
+    # further refined the layout to **4-bit tenantId + 6-bit semaphoreId +
+    # 1-bit FIFO-reserved MSB** (see design.md §5.2 v0.2.1 /
+    # fifo_device.hpp). Each MscclppAllReduce3 allocates 6 semaphores per
+    # peer-set, so accumulating across (sizes × tenants) silently overflows
+    # the semaphore-ID field — the proxy then signals the wrong semaphore
+    # and the GPU spins forever. Iter 5.5 added a host-side guard in
+    # ProxyService::addSemaphore that throws InvalidUsage on > 63, but
+    # re-creating the proxy_service per size is still the cleanest way to
+    # keep the running count under 64 across the full benchmark matrix.
     for nelems in sizes:
         proxy_service = TenantAwareProxyService(mode=mode)
         for i in range(num_tenants):
