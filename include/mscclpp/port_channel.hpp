@@ -14,6 +14,7 @@ namespace mscclpp {
 struct BasePortChannel;
 struct PortChannel;
 
+//NOTE: 新增handler decorator, context-aware handler decorator, progress hook,以及 BasePortChannel::setTenantId()
 /// MT-MSCCL++: a decorator that wraps the ProxyService's internal trigger
 /// handler with custom logic (e.g. tenant-aware scheduling). The decorator
 /// receives the inner handler and returns a new outer handler. See

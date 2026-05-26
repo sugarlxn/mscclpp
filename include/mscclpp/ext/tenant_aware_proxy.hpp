@@ -27,6 +27,7 @@
 //     (keyed by semaphoreId — same PortChannel = same proxy sem).
 //   - TriggerSync cannot pass older same-connection Data/Flag triggers, so
 //     flush boundaries stay correct under delayed dispatch.
+//NOTE: 新增核心 scheduler：per-tenant queue、single-tenant bypass、fail-open、DRR、StrictPriority+Aging、Hybrid、token bucket、progress tick、per-connection ordering。
 
 #ifndef MSCCLPP_EXT_TENANT_AWARE_PROXY_HPP_
 #define MSCCLPP_EXT_TENANT_AWARE_PROXY_HPP_
@@ -602,6 +603,7 @@ class TenantAwareProxyHandler {
   std::chrono::steady_clock::time_point lastUnregisteredWarnAt_{};
 };
 
+//NOTE: 添加 TenantAwareProxyService , HOST 创建 TenantAwareProxyService 通过 registerTenant/updateTenant 写入 tenant policy。
 /// A ProxyService that runs TenantAwareProxyHandler in the proxy thread.
 ///
 /// Use exactly like ProxyService — `addSemaphore`, `addMemory`, `portChannel`,

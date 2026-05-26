@@ -26,6 +26,7 @@ class ProxyService;
 /// Handler function type for proxy. Called once per ready FIFO trigger.
 using ProxyHandler = std::function<ProxyHandlerResult(ProxyTrigger)>;
 
+//NOTE: 新增 context-aware handler and ProxyFifoContext
 /// MT-MSCCL++ (design.md §5.7, v0.2.1): metadata captured AT POLL TIME — i.e.
 /// before the proxy thread calls `pop()` and before any tenant scheduler may
 /// delay dispatch. This is the only reliable place to record the FIFO

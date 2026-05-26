@@ -43,6 +43,7 @@ struct BasePortChannelDeviceHandle {
   // Host-pinned: proxy writes after CQ drain, GPU reads in waitFlush().
   uint64_t* flushDonePos_;
 
+  //NOTE: 添加 tenantID 所有put/signal/flush接口 push trigger 时携带tenantid
   // MT-MSCCL++ tenant ID (design.md §5.2). Piggybacks on every ProxyTrigger
   // pushed from this handle so the host-side scheduler can multiplex by
   // tenant. Defaults to 0 (mscclpp::ext::tenant::DEFAULT_TENANT) for backward

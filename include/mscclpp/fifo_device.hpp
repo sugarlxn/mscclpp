@@ -24,7 +24,8 @@ constexpr unsigned int TriggerBitsSize = 32;
 constexpr unsigned int TriggerBitsOffset = 32;
 constexpr unsigned int TriggerBitsMemoryId = 9;
 constexpr unsigned int TriggerBitsType = 3;
-// MT-MSCCL++ (design.md §5.2, v0.2.1): 4-bit tenant_id + 6-bit semaphoreId +
+
+//NOTE: 新增位域排序，添加 TenantID=4bit, SemaphoreId=6bit
 // 1 MSB reserved for the FIFO's push() XOR (see fifo.cc / proxy.cc — the host
 // ready/empty check is fst != 0 && snd != 0, and the MSB flip exists to ensure
 // snd != 0 after push). Business fields must NOT touch bit 63.
@@ -48,6 +49,7 @@ union alignas(16) ProxyTrigger {
     // First 64 bits: value[0]
     uint64_t size : TriggerBitsSize;
     uint64_t srcOffset : TriggerBitsOffset;
+    //NOTE: 匿名填充位
     uint64_t : (64 - TriggerBitsSize - TriggerBitsOffset);  // ensure 64-bit alignment
     // Second 64 bits: value[1] — low→high order MUST match the explicit
     // shift/mask encoder in the ctor below.
@@ -57,7 +59,10 @@ union alignas(16) ProxyTrigger {
     uint64_t type : TriggerBitsType;                // bits 50..52
     uint64_t tenantId : TriggerBitsTenantId;        // bits 53..56  (MT-MSCCL++ v0.2.1: 4 bits, 0..15)
     uint64_t semaphoreId : TriggerBitsSemaphoreId;  // bits 57..62  (shrunk from 10 → 6 bits)
-    uint64_t : TriggerBitsFifoReserved;             // bit 63 — FIFO reserved for push() XOR
+    ///NOTE: 匿名填充位 保证64位中最高位为 resrved, 
+    uint64_t : (64 - TriggerBitsOffset - TriggerBitsMemoryId - TriggerBitsMemoryId - TriggerBitsType -
+                TriggerBitsSemaphoreId - TriggerBitsFifoReserved);  // ensure 64-bit alignment 
+    uint64_t reserved : TriggerBitsFifoReserved;             // bit 63 — FIFO reserved for push() XOR
   } fields;
 
 #if defined(MSCCLPP_DEVICE_COMPILE)

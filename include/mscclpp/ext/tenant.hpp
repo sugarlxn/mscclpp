@@ -18,6 +18,7 @@ namespace mscclpp {
 namespace ext {
 namespace tenant {
 
+//NOTE: 新增 tenant 数据模型：TenantId、QoSClass、PolicyMode、TenantContext、BandwidthBudget、PolicyTable
 using TenantId = uint8_t;
 
 constexpr TenantId DEFAULT_TENANT = 0;

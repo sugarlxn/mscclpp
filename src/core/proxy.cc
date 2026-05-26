@@ -81,6 +81,7 @@ MSCCLPP_API_CPP void Proxy::start(bool blocking) {
       }
       trigger.snd ^= (uint64_t{1} << uint64_t{63});  // this is where the last bit of snd is reverted.
 
+      //NOTE: proxy poll loop 每轮跑 progress hook，poll 到 trigger 后恢复 bit63，并在 pop 前记录 fifoPos/enqueueNs。
       // MT-MSCCL++ (design.md §5.7, v0.2.1): capture fifoPos BEFORE the
       // handler may delay dispatch (e.g. via TenantAwareProxyHandler). At
       // this point the proxy thread is the sole FIFO consumer and has not

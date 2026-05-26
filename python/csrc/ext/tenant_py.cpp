@@ -14,6 +14,7 @@ namespace nb = nanobind;
 using namespace mscclpp;
 using namespace mscclpp::ext::tenant;
 
+//NOTE: 暴露 QoSClass、PolicyMode、TenantContext、TenantAwareProxyService
 void register_tenant(nb::module_& m) {
   nb::enum_<QoSClass>(m, "CppQoSClass")
       .value("BestEffort", QoSClass::BestEffort)

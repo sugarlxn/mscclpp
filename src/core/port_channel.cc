@@ -15,6 +15,7 @@
 namespace mscclpp {
 
 namespace {
+//NOTE: 添加对 semaphores memory tenantId的越界保护
 // MT-MSCCL++ (design.md §5.2, v0.2.1): host-side guards mirroring the
 // ProxyTrigger bit-field widths in fifo_device.hpp. Hard-throw on overflow
 // rather than silent truncation — iter4 lost a day to a silent semId
@@ -62,6 +63,8 @@ MSCCLPP_API_CPP ProxyService::ProxyService(int fifoSize) {
       INFO(CONN, "NUMA node of ProxyService proxy thread is set to ", deviceNumaNode);
     }
   };
+  //NOTE: PorxySerice 接入 context handler
+  //UNKOWN: 为啥 TriggerSync 使用 ctx.fifopos 
   // Legacy path kept for users who plug in a plain ProxyHandler decorator —
   // for them we never see scheduler delay, so picking up the current tail()
   // here is correct.

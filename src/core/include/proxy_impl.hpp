@@ -14,6 +14,7 @@
 namespace mscclpp {
 
 struct Proxy::Impl {
+  //NOTE: Proxy::Impl 增加 contextHandler setContextHandler
   // Legacy handler (ProxyTrigger only). Always populated. The proxy thread
   // uses this UNLESS contextHandler is also set, in which case the context
   // handler takes precedence — see design.md §5.7 (v0.2.1) for why context

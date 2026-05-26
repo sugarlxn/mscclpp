@@ -29,6 +29,7 @@ extern void register_algorithm(nb::module_& m);
 
 // ext
 extern void register_algorithm_collection_builder(nb::module_& m);
+//NOTE: 注册tenant binding
 extern void register_tenant(nb::module_& m);  // MT-MSCCL++ (design.md §3.5 / §5)
 
 template <typename T>

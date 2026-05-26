@@ -68,6 +68,7 @@ struct DeviceSyncer {
   unsigned int currentCountIdx_;
 };
 
+//UNKOWN: 暴露 DeviceSyncerSizeBytes，给 Python/CUDA benchmark 分配 per-instance syncer。
 /// MT-MSCCL++ (iter 6): allocation size of a single DeviceSyncer in bytes.
 /// Used by Python wrappers (e.g. MscclppAllReduce3) to allocate per-instance
 /// zero-initialized GPU buffers without hardcoding the struct size. If
