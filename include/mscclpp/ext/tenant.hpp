@@ -24,17 +24,17 @@ constexpr TenantId DEFAULT_TENANT = 0;
 constexpr unsigned int MAX_TENANTS = 16;  // 4-bit tenant_id (design.md §5.2, v0.2.1)
 
 enum class QoSClass : uint8_t {
-  BestEffort = 0,
-  Standard   = 1,
+  BestEffort = 0,  
+  Standard   = 1,  
   Premium    = 2,
   Realtime   = 3,
 };
 
 enum class PolicyMode : uint8_t {
-  SinglePassthrough = 0,
-  Fair              = 1,
-  StrictPriority    = 2,
-  Hybrid            = 3,
+  SinglePassthrough = 0,  //仅1个活跃租户 + scheduelr 队列为空时 bypass 
+  Fair              = 1,  //DRR / DRF 公平调度
+  StrictPriority    = 2,  //绝对优先级，带老化机制的 chunk 边界抢占
+  Hybrid            = 3,  //先 StrictPriority（仅 Premium/Realtime）优先，再 Fair
 };
 
 struct TenantContext {
