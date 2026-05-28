@@ -714,9 +714,10 @@ def main():
     comm = MPI.COMM_WORLD
     rank = comm.rank
     shm_comm = comm.Split_type(MPI.COMM_TYPE_SHARED, 0, MPI.INFO_NULL)
+    local_rank = shm_comm.rank
     n_per_node = shm_comm.size
     shm_comm.Free()
-    cp.cuda.Device(rank % n_per_node).use()
+    cp.cuda.Device(local_rank).use()
 
     iface, my_ip = get_net_iface()
     if iface is None:

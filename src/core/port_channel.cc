@@ -74,6 +74,7 @@ MSCCLPP_API_CPP ProxyService::ProxyService(int fifoSize) {
     ctx.enqueueNs = 0;
     return handleTrigger(triggerRaw, ctx);
   };
+  //NOTE: 创建了一个proxy对象，proxy对象poll FIFO, 读GPU推来的trigger
   proxy_ = std::make_shared<Proxy>(handlerFunc, initFunc, fifoSize);
   // MT-MSCCL++ (design.md §5.7, v0.2.1): also install a context-aware
   // handler so that the proxy thread can pass the poll-time fifoPos through

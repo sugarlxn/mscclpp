@@ -14,6 +14,7 @@ namespace nb = nanobind;
 using namespace mscclpp;
 using namespace mscclpp::ext::tenant;
 
+// 这是一层 nanobind Python binding。它不实现调度逻辑，只负责把 C++ 里的 MT-MSCCL++ tenant API 暴露给 Python
 //NOTE: 暴露 QoSClass、PolicyMode、TenantContext、TenantAwareProxyService
 void register_tenant(nb::module_& m) {
   nb::enum_<QoSClass>(m, "CppQoSClass")
