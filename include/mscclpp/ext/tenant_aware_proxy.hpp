@@ -603,7 +603,7 @@ class TenantAwareProxyHandler {
   std::chrono::steady_clock::time_point lastUnregisteredWarnAt_{};
 };
 
-//NOTE: 添加 TenantAwareProxyService , HOST 创建 TenantAwareProxyService 通过 registerTenant/updateTenant 写入 tenant policy。
+//NOTE: 新增 TenantAwareProxyService , HOST 创建 TenantAwareProxyService 通过 registerTenant/updateTenant 写入 tenant policy。
 /// A ProxyService that runs TenantAwareProxyHandler in the proxy thread.
 ///
 /// Use exactly like ProxyService — `addSemaphore`, `addMemory`, `portChannel`,

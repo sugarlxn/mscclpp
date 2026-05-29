@@ -30,6 +30,7 @@ MSCCLPP_DEVICE_INLINE void waitFlush(uint64_t* flushDonePos, uint64_t fifoPos, [
 #endif  // defined(MSCCLPP_DEVICE_COMPILE)
 }  // namespace detail
 
+//NOTE: BasePortChannerDeviceHandle 实现 put get signal flush wait 原语
 struct BasePortChannelDeviceHandle {
   SemaphoreId semaphoreId_;
 
@@ -154,7 +155,7 @@ struct PortChannelDeviceHandle : public BasePortChannelDeviceHandle {
   MemoryId src_;
 
   MSCCLPP_INLINE PortChannelDeviceHandle() = default;
-
+  //NOTE: PortChannelDeviceHandler 新增 TenantId 
   MSCCLPP_HOST_DEVICE_INLINE PortChannelDeviceHandle(SemaphoreId semaphoreId,
                                                      Host2DeviceSemaphoreDeviceHandle semaphore, FifoDeviceHandle fifo,
                                                      MemoryId dst, MemoryId src, uint64_t* flushDonePos,
