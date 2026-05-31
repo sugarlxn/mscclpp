@@ -351,6 +351,7 @@ class MscclppAllReduce4:
             bytes(4),  # padding for memory alignment
             ctypes.c_size_t(self.memory.size),
             self.pipeline_depth,
+            bytes(4),  # padding before DeviceSyncer* pointers
             self._main_syncer_buffer,
             self._reduce_scatter_syncer_buffer,
             self._all_gather_syncer_buffer,
