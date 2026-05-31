@@ -315,6 +315,18 @@ class MscclppAllReduce4:
             memoryview(b"".join(self.all_gather_proxy_device_handles)), dtype=cp.uint8
         )
 
+        # MT-MSCCL++ iter 8: AR4 can run concurrently across tenant streams.
+        # Keep each AR4 instance's grid-wide barriers independent; sharing the
+        # file-scope DeviceSyncers in allreduce.cu would corrupt counters.
+        try:
+            from mscclpp._mscclpp import DEVICE_SYNCER_SIZE_BYTES as _syncer_size
+        except ImportError:
+            _syncer_size = 16
+        self._main_syncer_buffer = cp.zeros(_syncer_size, dtype=cp.uint8)
+        self._reduce_scatter_syncer_buffer = cp.zeros(_syncer_size, dtype=cp.uint8)
+        self._all_gather_syncer_buffer = cp.zeros(_syncer_size, dtype=cp.uint8)
+        self._ib_syncer_buffer = cp.zeros(_syncer_size, dtype=cp.uint8)
+
         self.set_params(nblocks, block_size, pipeline_depth)
 
     def __call__(self, stream):
@@ -339,6 +351,10 @@ class MscclppAllReduce4:
             bytes(4),  # padding for memory alignment
             ctypes.c_size_t(self.memory.size),
             self.pipeline_depth,
+            self._main_syncer_buffer,
+            self._reduce_scatter_syncer_buffer,
+            self._all_gather_syncer_buffer,
+            self._ib_syncer_buffer,
         )
 
     def auto_tune(self):

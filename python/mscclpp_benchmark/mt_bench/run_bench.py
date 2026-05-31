@@ -454,23 +454,17 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
             # Iter 4: by default we interleave on a SINGLE stream so the
             # C++ scheduler sees per-tenant tagged triggers and reorders them
             # via the policy.
-            # Iter 6: K-parallel-stream mode now WORKS — the AllReduce3 kernel
-            # has been rewritten to take a per-instance DeviceSyncer pointer
-            # (see allreduce.cu + mscclpp_op.py:MscclppAllReduce3). Setting
-            # MTCCL_K_STREAMS=1 launches each tenant on its own stream so the
-            # GPU runs concurrent AllReduce kernels and the proxy thread sees
-            # concurrent triggers, exposing real C++ DRR / Priority behavior.
+            # Iter 6/8: K-parallel-stream mode now works for both AR3
+            # (single-node) and AR4 (cross-node). Both kernels take
+            # per-instance DeviceSyncer pointers, so setting MTCCL_K_STREAMS=1
+            # launches each tenant on its own stream and lets the proxy thread
+            # see concurrent tenant triggers, exposing real C++ DRR / Priority
+            # behavior.
             # NOTE: on intra-node NVLink the GPU compute is the bottleneck,
             # not the proxy queue, so DRR weight effects on bandwidth are
             # subtle. The host-only smoke test (test/unit/iter5_standalone
             # _smoke.cc) is the authoritative proof of scheduler correctness.
             single_stream_mode = os.environ.get("MTCCL_K_STREAMS", "0") != "1"
-            if group.nranks != (nranks_per_node or group.nranks):
-                # AR4 still uses file-scope DeviceSyncers in allreduce.cu.
-                # Concurrent cross-node AR4 kernels need the same per-instance
-                # syncer rewrite that AR3 received in iter6; until then, keep
-                # xnode cpp_mt on the proven single-stream smoke path.
-                single_stream_mode = True
             if single_stream_mode:
                 streams = {1: cp.cuda.Stream(non_blocking=True)}
             else:
