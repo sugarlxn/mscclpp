@@ -222,6 +222,61 @@ TEST(TenantSchedulerFailOpenTest, UnregisteredTenantReattributedToDefault) {
   ASSERT_EQ(rec.records().size(), 2u);
 }
 
+// -------- 4b) Scheduler debug counters expose the actual dequeue decisions.
+
+TEST(TenantSchedulerDebugCountersTest, DrrPicksAndDispatchedCountersIncrease) {
+  Recorder rec;
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
+  h.updateTenant({2, QoSClass::Standard, 3, 0, 0, 0, 0}, {0, 0, 0});
+
+  h.enqueueForTest(makeTrigger(1, 10, TriggerData, 16 * 1024), makeCtx(1));
+  h.enqueueForTest(makeTrigger(2, 11, TriggerData, 16 * 1024), makeCtx(2));
+  h.tickProgress();
+  h.tickProgress();
+
+  auto counters = h.schedulerDebugCounters();
+  EXPECT_GT(counters[1].drr_picks, 0u);
+  EXPECT_GT(counters[2].drr_picks, 0u);
+  EXPECT_EQ(counters[1].strict_priority_picks, 0u);
+  EXPECT_EQ(counters[2].strict_priority_picks, 0u);
+  EXPECT_EQ(counters[1].sched_dispatched_triggers, 1u);
+  EXPECT_EQ(counters[2].sched_dispatched_triggers, 1u);
+  EXPECT_EQ(counters[1].sched_dispatched_bytes, 16u * 1024u);
+  EXPECT_EQ(counters[2].sched_dispatched_bytes, 16u * 1024u);
+}
+
+TEST(TenantSchedulerDebugCountersTest, StrictPriorityPickCounterIncreases) {
+  Recorder rec;
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority);
+  h.updateTenant({1, QoSClass::Premium, 1, 0, 0, 0, 0}, {0, 0, 0});
+  h.updateTenant({2, QoSClass::BestEffort, 1, 0, 0, 0, 0}, {0, 0, 0});
+
+  h.enqueueForTest(makeTrigger(2, 20, TriggerData, 1024), makeCtx(1));
+  h.enqueueForTest(makeTrigger(1, 21, TriggerData, 1024), makeCtx(2));
+  h.tickProgress();
+
+  auto counters = h.schedulerDebugCounters();
+  EXPECT_GT(counters[1].strict_priority_picks, 0u);
+  EXPECT_EQ(counters[1].drr_picks, 0u);
+  EXPECT_EQ(counters[1].sched_dispatched_triggers, 1u);
+}
+
+TEST(TenantSchedulerDebugCountersTest, TokenBucketWaitCounterIncreasesWithoutDispatch) {
+  Recorder rec;
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 1, 0}, {/*bytes_per_second=*/1, /*burst_bytes=*/1, 0});
+
+  h.enqueueForTest(makeTrigger(1, 30, TriggerData, 4096), makeCtx(1));
+  h.enqueueForTest(makeTrigger(1, 30, TriggerData, 4096), makeCtx(2));
+  h.tickProgress();
+  h.tickProgress();
+
+  auto counters = h.schedulerDebugCounters();
+  EXPECT_EQ(counters[1].sched_dispatched_triggers, 1u);
+  EXPECT_GT(counters[1].token_bucket_waits, 0u);
+}
+
 // -------- 5) Bypass refuses to fire while scheduler queue is non-empty.
 //
 // Even when popcount(activeMask)<=1 due to aging or removal, the scheduler

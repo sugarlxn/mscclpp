@@ -55,5 +55,21 @@ void register_tenant(nb::module_& m) {
            nb::arg("weight") = 1, nb::arg("bandwidth_max_bps") = uint64_t{0}, nb::arg("burst_bytes") = uint64_t{0})
       .def("remove_tenant", &TenantAwareProxyService::removeTenant, nb::arg("tenant_id"))
       .def("set_mode", &TenantAwareProxyService::setMode, nb::arg("mode"))
+      .def("scheduler_debug_counters",
+           [](const TenantAwareProxyService& svc) {
+             auto counters = svc.schedulerDebugCounters();
+             nb::dict out;
+             for (uint32_t tid = 0; tid < MAX_TENANTS; ++tid) {
+               const auto& c = counters[tid];
+               nb::dict row;
+               row["sched_dispatched_triggers"] = c.sched_dispatched_triggers;
+               row["sched_dispatched_bytes"] = c.sched_dispatched_bytes;
+               row["token_bucket_waits"] = c.token_bucket_waits;
+               row["drr_picks"] = c.drr_picks;
+               row["strict_priority_picks"] = c.strict_priority_picks;
+               out[nb::int_(tid)] = row;
+             }
+             return out;
+           })
       .def("mode", &TenantAwareProxyService::mode);
 }

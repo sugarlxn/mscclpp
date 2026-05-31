@@ -540,7 +540,12 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
             mem_bytes = algos[1][1].nbytes
             if rank == 0:
                 wall_s_cpp = max(wall_end_s_cpp - wall_start_s_cpp, 1e-9)
+                if hasattr(proxy_service, "scheduler_debug_counters"):
+                    scheduler_counters = proxy_service.scheduler_debug_counters()
+                else:
+                    scheduler_counters = {}
                 for tid in range(1, num_tenants + 1):
+                    sched = scheduler_counters.get(tid, {})
                     span_ms = cp.cuda.get_elapsed_time(start_event,
                                                       end_events[tid])
                     ms_per_iter = span_ms / niter
@@ -592,14 +597,26 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
                         "world_size": comm.size,
                         "host": socket.gethostname(),
                         "dtype": str(dtype.__name__),
+                        "sched_dispatched_triggers": int(sched.get("sched_dispatched_triggers", 0)),
+                        "sched_dispatched_bytes": int(sched.get("sched_dispatched_bytes", 0)),
+                        "token_bucket_waits": int(sched.get("token_bucket_waits", 0)),
+                        "drr_picks": int(sched.get("drr_picks", 0)),
+                        "strict_priority_picks": int(sched.get("strict_priority_picks", 0)),
                     })
                     cap_str = (f" cap={caps[tid-1]/1e9:.0f}GB/s"
                                if caps[tid - 1] > 0 else "")
                     w_str = (f" w={weights_eff[tid-1]}"
                              if weights_eff[tid-1] != 1 else "")
+                    sched_str = (
+                        f" disp={int(sched.get('sched_dispatched_triggers', 0))}"
+                        f" drr={int(sched.get('drr_picks', 0))}"
+                        f" sp={int(sched.get('strict_priority_picks', 0))}"
+                        f" wait={int(sched.get('token_bucket_waits', 0))}"
+                    )
                     print(f"  [cpp_mt tenant {tid} {qos.name:11s}{cap_str}{w_str}] "
                           f"{human_size(mem_bytes):>8s}  "
-                          f"{time_us:8.2f} us  {bw:7.2f} GB/s", flush=True)
+                          f"{time_us:8.2f} us  {bw:7.2f} GB/s"
+                          f"{sched_str}", flush=True)
             comm.barrier()
         finally:
             proxy_service.stop_proxy()
@@ -956,6 +973,8 @@ def main():
             "tenant_id", "qos_class", "size_bytes", "size_human", "niter",
             "time_us", "alg_bw_gbps", "wallclock_gbps", "wall_s", "bytes_sent",
             "rank", "world_size", "host", "dtype",
+            "sched_dispatched_triggers", "sched_dispatched_bytes",
+            "token_bucket_waits", "drr_picks", "strict_priority_picks",
         ]
         write_header = not os.path.exists(args.out)
         with open(args.out, "a", newline="") as f:

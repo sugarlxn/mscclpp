@@ -51,6 +51,14 @@ namespace mscclpp {
 namespace ext {
 namespace tenant {
 
+struct SchedulerDebugCounters {
+  uint64_t sched_dispatched_triggers = 0;
+  uint64_t sched_dispatched_bytes = 0;
+  uint64_t token_bucket_waits = 0;
+  uint64_t drr_picks = 0;
+  uint64_t strict_priority_picks = 0;
+};
+
 /// Token-bucket rate limiter (design.md §6.3.1).
 class TokenBucket {
  public:
@@ -334,6 +342,7 @@ class TenantAwareProxyHandler {
 
       // Rate limit check (bucket has its own internal mutex; cheap).
       if (!buckets_[pickedTid].tryConsume(size == 0 ? 1 : size)) {
+        debugCounters_[pickedTid].token_bucket_waits++;
         // Bucket dry. Refund the size that pickDrrLocked speculatively
         // decremented from this tenant's deficit; leave any credit issued
         // this turn intact. Then push drrCurrent_ off this tenant so the
@@ -352,6 +361,8 @@ class TenantAwareProxyHandler {
       if (!cq.empty() && cq.front() == picked.seq) {
         cq.pop_front();
       }
+      debugCounters_[pickedTid].sched_dispatched_triggers++;
+      debugCounters_[pickedTid].sched_dispatched_bytes += size;
     }
     // Outside the queue lock: dispatch with the ORIGINAL push-time context.
     // This is the v0.2.1 invariant: TriggerSync flush boundaries follow the
@@ -468,6 +479,7 @@ class TenantAwareProxyHandler {
         best = t;
       }
     }
+    if (best < MAX_TENANTS) debugCounters_[best].strict_priority_picks++;
     return best;
   }
 
@@ -498,6 +510,7 @@ class TenantAwareProxyHandler {
     if (drrCurrent_ < MAX_TENANTS && canServe(drrCurrent_)) {
       uint32_t t = drrCurrent_;
       deficit_[t] -= static_cast<int64_t>(headSize(queues_[t].front()));
+      debugCounters_[t].drr_picks++;
       return t;
     }
 
@@ -523,6 +536,7 @@ class TenantAwareProxyHandler {
           drrCurrent_ = t;
           drrCursor_ = (t + 1) % MAX_TENANTS;
           deficit_[t] -= static_cast<int64_t>(headSize(queues_[t].front()));
+          debugCounters_[t].drr_picks++;
           return t;
         }
         // Credit didn't cover — tenant t's head is bigger than weight×quantum.
@@ -543,6 +557,7 @@ class TenantAwareProxyHandler {
         drrCurrent_ = t;
         drrCursor_ = (t + 1) % MAX_TENANTS;
         deficit_[t] = 0;
+        debugCounters_[t].drr_picks++;
         return t;
       }
     }
@@ -578,12 +593,17 @@ class TenantAwareProxyHandler {
     return unregisteredCount_.load(std::memory_order_relaxed);
   }
 
+  std::array<SchedulerDebugCounters, MAX_TENANTS> schedulerDebugCounters() const {
+    std::lock_guard<std::mutex> g(mu_);
+    return debugCounters_;
+  }
+
  private:
   ContextProxyHandler inner_;
   std::atomic<uint32_t> activeMask_{0};
   std::atomic<uint32_t> registeredMask_{0};
   PolicyMode mode_;
-  std::mutex mu_;
+  mutable std::mutex mu_;
   std::array<std::deque<PendingTrigger>, MAX_TENANTS> queues_{};
   // Per-connection FIFO of pending seq numbers — order of arrival on each
   // semaphoreId. Heterogeneous map so we only pay for actually-used keys.
@@ -593,6 +613,7 @@ class TenantAwareProxyHandler {
   std::array<TokenBucket, MAX_TENANTS> buckets_{};
   // DRR deficit (signed; can be temporarily negative after the escape hatch).
   std::array<int64_t, MAX_TENANTS> deficit_{};
+  std::array<SchedulerDebugCounters, MAX_TENANTS> debugCounters_{};
   uint64_t nextSeq_ = 0;
   uint32_t rrCursor_ = 0;
   uint32_t drrCursor_ = 0;
@@ -667,6 +688,10 @@ class TenantAwareProxyService : public ProxyService {
   /// DEFAULT_TENANT (fail-open). > 0 indicates kernels ran ahead of policyd
   /// registration; sustained growth is a deeper config bug.
   uint64_t unregisteredTriggerCount() const { return handler_->unregisteredTriggerCount(); }
+
+  std::array<SchedulerDebugCounters, MAX_TENANTS> schedulerDebugCounters() const {
+    return handler_->schedulerDebugCounters();
+  }
 
  private:
   std::shared_ptr<TenantAwareProxyHandler> handler_;
