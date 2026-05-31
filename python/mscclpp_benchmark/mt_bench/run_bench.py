@@ -35,7 +35,8 @@ import ipaddress
 # Make the sibling modules importable when invoked via -m or directly.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mscclpp_op import (  # noqa: E402
-    MscclppAllReduce1, MscclppAllReduce2, MscclppAllReduce3, MscclppAllReduce6,
+    MscclppAllReduce1, MscclppAllReduce2, MscclppAllReduce3, MscclppAllReduce4,
+    MscclppAllReduce6,
 )
 from nccl_op import NcclAllReduce  # noqa: E402
 
@@ -126,6 +127,73 @@ def assign_tenant_to_allreduce3(algo, tenant_id):
     algo.set_params(algo.nblocks, algo.block_size)
 
 
+def assign_tenant_to_allreduce4(algo, tenant_id):
+    """Tag AR4's proxy-backed cross-node channels with a tenant id.
+
+    AR4 has two PortChannel groups: reduce-scatter and all-gather. The local
+    intra-node MemoryChannels are intentionally left untouched because they do
+    not flow through the host proxy scheduler.
+    """
+    for r in range(algo.group.nranks):
+        if r == algo.group.my_rank:
+            continue
+        algo.reduce_scatter_port_channels[r].set_tenant_id(tenant_id)
+        algo.all_gather_port_channels[r].set_tenant_id(tenant_id)
+
+    algo.reduce_sactter_proxy_device_handles = [
+        algo.reduce_scatter_port_channels[r].device_handle().raw
+        for r in range(algo.group.nranks) if r != algo.group.my_rank
+    ]
+    algo.all_gather_proxy_device_handles = [
+        algo.all_gather_port_channels[r].device_handle().raw
+        for r in range(algo.group.nranks) if r != algo.group.my_rank
+    ]
+    algo.reduce_sactter_proxy_device_handles_cp = cp.asarray(
+        memoryview(b"".join(algo.reduce_sactter_proxy_device_handles)), dtype=cp.uint8)
+    algo.all_gather_proxy_device_handles_cp = cp.asarray(
+        memoryview(b"".join(algo.all_gather_proxy_device_handles)), dtype=cp.uint8)
+    algo.set_params(algo.nblocks, algo.block_size, algo.pipeline_depth)
+
+
+def validate_xnode_ar4_size(nelems, dtype, world_size, nranks_per_node):
+    """Fail fast for AR4's known cross-node shape constraints."""
+    if nranks_per_node < 2:
+        raise ValueError(
+            "cross-node AR4 requires at least 2 ranks per node; "
+            f"got nranks_per_node={nranks_per_node}"
+        )
+    if world_size % nranks_per_node != 0:
+        raise ValueError(
+            "world_size must be divisible by nranks_per_node for AR4; "
+            f"got world_size={world_size}, nranks_per_node={nranks_per_node}"
+        )
+    # AR4 internally normalizes nelems to sizeof(int) chunks and uses the
+    # default pipeline_depth=3. The iter7 xnode baseline only proved the
+    # 3*2^N family; reject other shapes instead of letting the kernel fail
+    # later with cudaErrorMisalignedAddress.
+    elems_per_int = max(1, 4 // dtype().itemsize)
+    if nelems % elems_per_int != 0:
+        raise ValueError(
+            f"AR4 requires nelems divisible by {elems_per_int} for {dtype.__name__}; "
+            f"got {nelems}"
+        )
+    int_elems = nelems // elems_per_int
+    if int_elems % (world_size * 3) != 0:
+        raise ValueError(
+            "cross-node AR4 requires element counts compatible with "
+            f"world_size*pipeline_depth={world_size * 3}; got nelems={nelems}. "
+            "Use iter7 sizes such as --dtype fp16 "
+            "--sizes 6291456,25165824,100663296,201326592"
+        )
+
+
+def make_cpp_mt_algo(group, memory, memory_out, proxy_service, nranks_per_node):
+    if group.nranks == nranks_per_node:
+        return MscclppAllReduce3(group, memory, proxy_service), assign_tenant_to_allreduce3
+    validate_xnode_ar4_size(memory.size, memory.dtype, group.nranks, nranks_per_node)
+    return MscclppAllReduce4(group, memory, nranks_per_node, proxy_service), assign_tenant_to_allreduce4
+
+
 # --------------------------------------------------------------------------- #
 # Backend wrappers
 # --------------------------------------------------------------------------- #
@@ -133,7 +201,7 @@ def assign_tenant_to_allreduce3(algo, tenant_id):
 class Backend:
     name = "unknown"
 
-    def setup(self, group, nccl_comm, memory, memory_out, proxy_service):
+    def setup(self, group, nccl_comm, memory, memory_out, proxy_service, nranks_per_node=None):
         raise NotImplementedError
 
     def __call__(self, stream):
@@ -146,7 +214,7 @@ class Backend:
 class NcclBackend(Backend):
     name = "nccl"
 
-    def setup(self, group, nccl_comm, memory, memory_out, proxy_service):
+    def setup(self, group, nccl_comm, memory, memory_out, proxy_service, nranks_per_node=None):
         self.op = NcclAllReduce(nccl_comm, memory)
 
     def __call__(self, stream):
@@ -158,11 +226,15 @@ class MscclppVanillaBackend(Backend):
 
     name = "mscclpp_vanilla"
 
-    def setup(self, group, nccl_comm, memory, memory_out, proxy_service):
-        self.algo = self._select_algo(group, memory, memory_out, proxy_service)
+    def setup(self, group, nccl_comm, memory, memory_out, proxy_service, nranks_per_node=None):
+        self.algo = self._select_algo(group, memory, memory_out, proxy_service, nranks_per_node)
 
     @staticmethod
-    def _select_algo(group, memory, memory_out, proxy_service):
+    def _select_algo(group, memory, memory_out, proxy_service, nranks_per_node=None):
+        if nranks_per_node is not None and group.nranks != nranks_per_node:
+            validate_xnode_ar4_size(memory.size, memory.dtype, group.nranks, nranks_per_node)
+            return MscclppAllReduce4(group, memory, nranks_per_node, proxy_service)
+
         nbytes = memory.nbytes
         if nbytes < (1 << 20):
             return MscclppAllReduce2(group, memory, memory_out)
@@ -198,9 +270,9 @@ class MscclppMtBackend(Backend):
         self.scheduler = None
         self.algo = None
 
-    def setup(self, group, nccl_comm, memory, memory_out, proxy_service):
+    def setup(self, group, nccl_comm, memory, memory_out, proxy_service, nranks_per_node=None):
         self.algo = MscclppVanillaBackend._select_algo(
-            group, memory, memory_out, proxy_service)
+            group, memory, memory_out, proxy_service, nranks_per_node)
         if self.mode == PolicyMode.SINGLE_PASSTHROUGH:
             # True bypass: keep the CSV/backend label, but do not start the
             # Python scheduler thread or submit WorkItems. On some systems the
@@ -266,7 +338,8 @@ def bench_mt_inline(niter, backend: MscclppMtBackend):
 # --------------------------------------------------------------------------- #
 
 def run_one(backend_name, mode_or_none, scenario, sizes, niter,
-            group, nccl_comm, dtype, comm, rank, results, run_id):
+            group, nccl_comm, dtype, comm, rank, results, run_id,
+            nranks_per_node=None):
     proxy_service = ProxyService()
     proxy_service.start_proxy()
     try:
@@ -284,7 +357,7 @@ def run_one(backend_name, mode_or_none, scenario, sizes, niter,
             else:
                 raise ValueError(backend_name)
 
-            bk.setup(group, nccl_comm, memory, memory_out, proxy_service)
+            bk.setup(group, nccl_comm, memory, memory_out, proxy_service, nranks_per_node)
             comm.barrier()
 
             if isinstance(bk, MscclppMtBackend) and mode_or_none != PolicyMode.SINGLE_PASSTHROUGH:
@@ -327,7 +400,7 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
                          group, nccl_comm, dtype, comm, rank, results, run_id,
                          mode=PolicyMode.FAIR, qos_classes=None,
                          bandwidth_caps_bps=None, weights=None,
-                         use_cuda_graph=True):
+                         use_cuda_graph=True, nranks_per_node=None):
     """Iter 4: K independent algo instances, each tagged with its tenant_id.
     All share one TenantAwareProxyService — the C++ proxy thread does the
     reordering. Each tenant runs on its OWN CUDA stream so triggers from
@@ -364,8 +437,9 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
                 mem = GpuBuffer(nelems, dtype=dtype)
                 mem_out = GpuBuffer(nelems, dtype=dtype)
                 cp.cuda.runtime.deviceSynchronize()
-                algo = MscclppAllReduce3(group, mem, proxy_service)
-                assign_tenant_to_allreduce3(algo, tid)
+                algo, assign_tenant = make_cpp_mt_algo(
+                    group, mem, mem_out, proxy_service, nranks_per_node or group.nranks)
+                assign_tenant(algo, tid)
                 algos[tid] = (algo, mem)
             comm.barrier()
 
@@ -390,6 +464,12 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
             # subtle. The host-only smoke test (test/unit/iter5_standalone
             # _smoke.cc) is the authoritative proof of scheduler correctness.
             single_stream_mode = os.environ.get("MTCCL_K_STREAMS", "0") != "1"
+            if group.nranks != (nranks_per_node or group.nranks):
+                # AR4 still uses file-scope DeviceSyncers in allreduce.cu.
+                # Concurrent cross-node AR4 kernels need the same per-instance
+                # syncer rewrite that AR3 received in iter6; until then, keep
+                # xnode cpp_mt on the proven single-stream smoke path.
+                single_stream_mode = True
             if single_stream_mode:
                 streams = {1: cp.cuda.Stream(non_blocking=True)}
             else:
@@ -536,7 +616,8 @@ def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
                      bandwidth_caps_bps=None,
                      enforce_rate_limit=False,
                      weights=None,
-                     use_cpp_proxy=True):
+                     use_cpp_proxy=True,
+                     nranks_per_node=None):
     """Emulate K tenants sharing the same comm by interleaving their AllReduce.
 
     Iter 2 design (design.md §5.3, §6.3):
@@ -566,7 +647,7 @@ def run_multi_tenant(scenario_name, num_tenants, sizes, niter,
             memory_out = GpuBuffer(nelems, dtype=dtype)
             cp.cuda.runtime.deviceSynchronize()
             algo = MscclppVanillaBackend._select_algo(
-                group, memory, memory_out, proxy_service)
+                group, memory, memory_out, proxy_service, nranks_per_node)
 
             qos_classes = qos_classes or [QoSClass.STANDARD] * num_tenants
             caps = list(bandwidth_caps_bps) if bandwidth_caps_bps \
@@ -765,7 +846,8 @@ def main():
             ("mscclpp_mt", PolicyMode.SINGLE_PASSTHROUGH),
         ]:
             run_one(bk_name, mode, "single_tenant", sizes, args.niter,
-                    group, nccl_comm, dtype, comm, rank, results, run_id)
+                    group, nccl_comm, dtype, comm, rank, results, run_id,
+                    nranks_per_node=n_per_node)
 
     if "multi2" in scenarios:
         if rank == 0:
@@ -773,7 +855,8 @@ def main():
                   flush=True)
         run_multi_tenant("multi_tenant_2x_fair", 2, sizes, args.niter,
                          group, nccl_comm, dtype, comm, rank, results, run_id,
-                         mode=PolicyMode.FAIR)
+                         mode=PolicyMode.FAIR,
+                         nranks_per_node=n_per_node)
 
     if "weighted_fair" in scenarios:
         if rank == 0:
@@ -782,14 +865,16 @@ def main():
         run_multi_tenant("weighted_fair_1to3", 2, sizes, args.niter,
                          group, nccl_comm, dtype, comm, rank, results, run_id,
                          mode=PolicyMode.FAIR,
-                         weights=[1, 3])
+                         weights=[1, 3],
+                         nranks_per_node=n_per_node)
 
     if "multi4" in scenarios:
         if rank == 0:
             print("\n--- scenario: multi_tenant_4x (FAIR) ---", flush=True)
         run_multi_tenant("multi_tenant_4x_fair", 4, sizes, args.niter,
                          group, nccl_comm, dtype, comm, rank, results, run_id,
-                         mode=PolicyMode.FAIR)
+                         mode=PolicyMode.FAIR,
+                         nranks_per_node=n_per_node)
 
     if "rate_limited" in scenarios:
         if rank == 0:
@@ -802,7 +887,8 @@ def main():
                          mode=PolicyMode.FAIR,
                          qos_classes=[QoSClass.STANDARD, QoSClass.STANDARD],
                          bandwidth_caps_bps=[0, cap_bps],
-                         enforce_rate_limit=True)
+                         enforce_rate_limit=True,
+                         nranks_per_node=n_per_node)
 
     use_graph = not args.no_cuda_graph
     if "cpp_mt_fair" in scenarios:
@@ -811,7 +897,8 @@ def main():
                   f"cuda_graph={use_graph}) ---", flush=True)
         run_multi_tenant_cpp("cpp_mt_fair", 2, sizes, args.niter,
                              group, nccl_comm, dtype, comm, rank, results, run_id,
-                             mode=PolicyMode.FAIR, use_cuda_graph=use_graph)
+                             mode=PolicyMode.FAIR, use_cuda_graph=use_graph,
+                             nranks_per_node=n_per_node)
 
     if "cpp_mt_priority" in scenarios:
         if rank == 0:
@@ -822,7 +909,8 @@ def main():
                              mode=PolicyMode.STRICT_PRIORITY,
                              qos_classes=[QoSClass.PREMIUM, QoSClass.BEST_EFFORT,
                                           QoSClass.BEST_EFFORT],
-                             use_cuda_graph=use_graph)
+                             use_cuda_graph=use_graph,
+                             nranks_per_node=n_per_node)
 
     if "cpp_mt_weighted" in scenarios:
         if rank == 0:
@@ -831,7 +919,8 @@ def main():
         run_multi_tenant_cpp("cpp_mt_weighted_1to3", 2, sizes, args.niter,
                              group, nccl_comm, dtype, comm, rank, results, run_id,
                              mode=PolicyMode.FAIR, weights=[1, 3],
-                             use_cuda_graph=use_graph)
+                             use_cuda_graph=use_graph,
+                             nranks_per_node=n_per_node)
 
     if "cpp_mt_rate_limited" in scenarios:
         # Iter 6: prove the C++ token bucket actually caps tenant 2's
@@ -848,7 +937,8 @@ def main():
                              group, nccl_comm, dtype, comm, rank, results, run_id,
                              mode=PolicyMode.FAIR,
                              bandwidth_caps_bps=[0, cap_bps_cpp],
-                             use_cuda_graph=use_graph)
+                             use_cuda_graph=use_graph,
+                             nranks_per_node=n_per_node)
 
     if "priority" in scenarios:
         if rank == 0:
@@ -859,7 +949,8 @@ def main():
                          mode=PolicyMode.STRICT_PRIORITY,
                          qos_classes=[QoSClass.PREMIUM,
                                       QoSClass.BEST_EFFORT,
-                                      QoSClass.BEST_EFFORT])
+                                      QoSClass.BEST_EFFORT],
+                         nranks_per_node=n_per_node)
 
     if rank == 0:
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
