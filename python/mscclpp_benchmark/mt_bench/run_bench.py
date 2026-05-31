@@ -201,6 +201,14 @@ class MscclppMtBackend(Backend):
     def setup(self, group, nccl_comm, memory, memory_out, proxy_service):
         self.algo = MscclppVanillaBackend._select_algo(
             group, memory, memory_out, proxy_service)
+        if self.mode == PolicyMode.SINGLE_PASSTHROUGH:
+            # True bypass: keep the CSV/backend label, but do not start the
+            # Python scheduler thread or submit WorkItems. On some systems the
+            # idle scheduler thread can interact badly with CUDA graph replay
+            # in this single-tenant path, and it is not measuring proxy QoS
+            # behavior anyway.
+            return
+
         # Single-tenant table → SINGLE_PASSTHROUGH bypass when mode allows.
         table = build_policy(self.mode, [{
             "tenant_id": self.tenant_id,
@@ -212,6 +220,9 @@ class MscclppMtBackend(Backend):
         self.scheduler.start()
 
     def __call__(self, stream):
+        if self.mode == PolicyMode.SINGLE_PASSTHROUGH:
+            return self.algo(stream)
+
         done = []
         def cb():
             self.algo(stream)
