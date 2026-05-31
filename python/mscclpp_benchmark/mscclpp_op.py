@@ -21,11 +21,12 @@ IB_TRANSPORTS = [
 
 
 def type_to_str(dtype):
-    if dtype == cp.float16:
+    dtype = cp.dtype(dtype)
+    if dtype == cp.dtype(cp.float16):
         return "__half"
-    elif dtype == cp.float32:
+    elif dtype == cp.dtype(cp.float32):
         return "float"
-    elif dtype == cp.int32:
+    elif dtype == cp.dtype(cp.int32):
         return "int"
     else:
         raise RuntimeError("Unknown data type")
@@ -454,7 +455,7 @@ class MscclppAllReduce6:
         nblocks: int = 32,
     ):
         self.group = group
-        datatype_size = memory_dtype().itemsize
+        datatype_size = cp.dtype(memory_dtype).itemsize
         buffer_size = nelem * datatype_size
         type_str = type_to_str(memory_dtype)
         all_ranks = list(range(group.nranks))

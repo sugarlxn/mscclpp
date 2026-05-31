@@ -157,6 +157,7 @@ def assign_tenant_to_allreduce4(algo, tenant_id):
 
 def validate_xnode_ar4_size(nelems, dtype, world_size, nranks_per_node):
     """Fail fast for AR4's known cross-node shape constraints."""
+    dtype_obj = cp.dtype(dtype)
     if nranks_per_node < 2:
         raise ValueError(
             "cross-node AR4 requires at least 2 ranks per node; "
@@ -171,10 +172,10 @@ def validate_xnode_ar4_size(nelems, dtype, world_size, nranks_per_node):
     # default pipeline_depth=3. The iter7 xnode baseline only proved the
     # 3*2^N family; reject other shapes instead of letting the kernel fail
     # later with cudaErrorMisalignedAddress.
-    elems_per_int = max(1, 4 // dtype().itemsize)
+    elems_per_int = max(1, 4 // dtype_obj.itemsize)
     if nelems % elems_per_int != 0:
         raise ValueError(
-            f"AR4 requires nelems divisible by {elems_per_int} for {dtype.__name__}; "
+            f"AR4 requires nelems divisible by {elems_per_int} for {dtype_obj.name}; "
             f"got {nelems}"
         )
     int_elems = nelems // elems_per_int
