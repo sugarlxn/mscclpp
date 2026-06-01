@@ -59,6 +59,8 @@ struct SchedulerDebugCounters {
   uint64_t strict_priority_picks = 0;
 };
 
+constexpr uint32_t DEFAULT_SCHEDULING_WINDOW_SIZE = 5;
+
 /// Token-bucket rate limiter (design.md §6.3.1).
 class TokenBucket {
  public:
@@ -161,14 +163,18 @@ class TokenBucket {
 ///       so a kernel that beats policyd registration cannot deadlock,
 ///   (3) records the tenant in activeMask_ BEFORE checking bypass,
 ///   (4) bypasses scheduling iff popcount(activeMask)<=1 AND all queues empty,
-///   (5) otherwise enqueues per (tenantId, connectionKey) and drains via the
-///       configured PolicyMode while preserving same-connection program order.
+///   (5) otherwise enqueues per (tenantId, connectionKey) into a bounded
+///       scheduling window and drains via the configured PolicyMode while
+///       preserving same-connection program order.
 ///
 /// Returns Continue/Stop matching the inner handler's last call.
 class TenantAwareProxyHandler {
  public:
-  TenantAwareProxyHandler(ContextProxyHandler inner, PolicyMode mode = PolicyMode::SinglePassthrough)
-      : inner_(std::move(inner)), mode_(mode) {}
+  TenantAwareProxyHandler(ContextProxyHandler inner, PolicyMode mode = PolicyMode::SinglePassthrough,
+                          uint32_t schedulingWindowSize = DEFAULT_SCHEDULING_WINDOW_SIZE)
+      : inner_(std::move(inner)),
+        mode_(mode),
+        schedulingWindowSize_(schedulingWindowSize == 0 ? 1 : schedulingWindowSize) {}
 
   /// Re-point the inner handler (used by TenantAwareProxyService, where the
   /// handler is created before the inner is known).
@@ -259,30 +265,34 @@ class TenantAwareProxyHandler {
       }
     }
 
-    // (5) Slow path: enqueue with monotonic sequence + connection key, drain.
+    // (5) Slow path: enqueue with monotonic sequence + connection key. Once
+    //     the scheduling window is full, drain exactly one trigger according
+    //     to the configured tenant policy. If the window is not full yet, an
+    //     idle proxy poll will drain the partial window via tickProgress().
     //     CRITICAL: the PendingTrigger stores the *push-time* fifoPos from
     //     ctx, NOT a fresh fifo->tail() — that's the whole point of the
     //     ContextProxyHandler ABI (design.md §5.7).
+    bool shouldDrain = false;
     {
       std::lock_guard<std::mutex> g(mu_);
       uint64_t seq = nextSeq_++;
       uint32_t connKey = static_cast<uint32_t>(trig.fields.semaphoreId);
       queues_[tid].push_back(PendingTrigger{trig, seq, connKey, ctx});
+      pendingCount_++;
       // Per-connection arrival order: this seq is now the youngest pending
       // trigger on connKey. The matching pop happens in drain() once this
       // trigger is actually dispatched.
       connQueues_[connKey].push_back(seq);
+      shouldDrain = pendingCount_ >= schedulingWindowSize_;
     }
-    return drain();
+    return shouldDrain ? drain() : ProxyHandlerResult::Continue;
   }
 
   /// Test-only accessor: total pending PendingTrigger across all tenant queues.
   /// Used by unit tests for the per-connection ordering invariant.
   size_t pendingCountForTest() {
     std::lock_guard<std::mutex> g(mu_);
-    size_t n = 0;
-    for (auto& q : queues_) n += q.size();
-    return n;
+    return pendingCount_;
   }
 
   /// Test-only: enqueue a trigger WITHOUT draining. Lets a unit test
@@ -298,6 +308,7 @@ class TenantAwareProxyHandler {
     uint64_t seq = nextSeq_++;
     uint32_t connKey = static_cast<uint32_t>(trig.fields.semaphoreId);
     queues_[tid].push_back(PendingTrigger{trig, seq, connKey, ctx});
+    pendingCount_++;
     connQueues_[connKey].push_back(seq);
   }
 
@@ -353,6 +364,7 @@ class TenantAwareProxyHandler {
         return ProxyHandlerResult::Continue;
       }
       q.pop_front();
+      pendingCount_--;
       // Per-connection ordering: pickNextLocked() only returned a trigger
       // whose seq is the current head of connQueues_[connKey], so popping
       // the front here keeps the invariant.
@@ -373,9 +385,7 @@ class TenantAwareProxyHandler {
 
   // Caller must hold mu_. True iff every tenant queue is empty.
   bool allQueuesEmptyLocked() const {
-    for (const auto& q : queues_)
-      if (!q.empty()) return false;
-    return true;
+    return pendingCount_ == 0;
   }
 
   // Caller must hold mu_. Returns true iff the front of queues_[tid] is
@@ -603,6 +613,7 @@ class TenantAwareProxyHandler {
   std::atomic<uint32_t> activeMask_{0};
   std::atomic<uint32_t> registeredMask_{0};
   PolicyMode mode_;
+  uint32_t schedulingWindowSize_;
   mutable std::mutex mu_;
   std::array<std::deque<PendingTrigger>, MAX_TENANTS> queues_{};
   // Per-connection FIFO of pending seq numbers — order of arrival on each
@@ -615,6 +626,7 @@ class TenantAwareProxyHandler {
   std::array<int64_t, MAX_TENANTS> deficit_{};
   std::array<SchedulerDebugCounters, MAX_TENANTS> debugCounters_{};
   uint64_t nextSeq_ = 0;
+  size_t pendingCount_ = 0;
   uint32_t rrCursor_ = 0;
   uint32_t drrCursor_ = 0;
   // DRR active turn: which tenant currently "owns" the dispatch cursor.
@@ -643,9 +655,10 @@ class TenantAwareProxyHandler {
 /// in iter 3 (fixes iter 2 limitation #1).
 class TenantAwareProxyService : public ProxyService {
  public:
-  TenantAwareProxyService(PolicyMode mode = PolicyMode::SinglePassthrough, int fifoSize = DEFAULT_FIFO_SIZE)
+  TenantAwareProxyService(PolicyMode mode = PolicyMode::SinglePassthrough, int fifoSize = DEFAULT_FIFO_SIZE,
+                          uint32_t schedulingWindowSize = DEFAULT_SCHEDULING_WINDOW_SIZE)
       : ProxyService(fifoSize),
-        handler_(std::make_shared<TenantAwareProxyHandler>(ContextProxyHandler{}, mode)) {
+        handler_(std::make_shared<TenantAwareProxyHandler>(ContextProxyHandler{}, mode, schedulingWindowSize)) {
     // The decorator captures handler_ (constructed BEFORE this lambda runs)
     // and installs it as the proxy's outer context-aware handler.
     // Using setContextHandlerDecorator (not setHandlerDecorator) is what
@@ -656,14 +669,11 @@ class TenantAwareProxyService : public ProxyService {
       h->setInner(std::move(inner));
       return h->asHandler();
     });
-    // MT-MSCCL++ (design.md §5.3.3 v0.2.1): chain a tenant progress tick
-    // AFTER the base ProxyService::progressFlushes(). The proxy thread
-    // calls this every iteration of the poll loop, so a rate-limited
-    // tenant whose token bucket has just refilled (but no new trigger has
-    // arrived) still gets drained promptly instead of waiting for the
-    // next FIFO push. Same for aging-promoted BestEffort triggers — the
-    // tick re-evaluates priorities every loop.
-    setExtraProgressHook([h]() { h->tickProgress(); });
+    // MT-MSCCL++: drain partial scheduling windows only when the proxy poll
+    // loop is idle. Per-iteration progressFlushes() still runs in the base
+    // ProxyService, but idle-only draining lets active windows fill before
+    // tenant policy picks a trigger.
+    setIdleProgressHook([h]() { h->tickProgress(); });
   }
 
   /// Register or update a tenant's policy and rate-limit budget. Thread-safe

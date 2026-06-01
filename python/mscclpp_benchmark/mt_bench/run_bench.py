@@ -401,7 +401,8 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
                          group, nccl_comm, dtype, comm, rank, results, run_id,
                          mode=PolicyMode.FAIR, qos_classes=None,
                          bandwidth_caps_bps=None, weights=None,
-                         use_cuda_graph=True, nranks_per_node=None):
+                         use_cuda_graph=True, nranks_per_node=None,
+                         sched_window_size=5):
     """Iter 4: K independent algo instances, each tagged with its tenant_id.
     All share one TenantAwareProxyService — the C++ proxy thread does the
     reordering. Each tenant runs on its OWN CUDA stream so triggers from
@@ -410,6 +411,8 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
     With `use_cuda_graph=True`, each tenant's per-iter launch sequence is
     captured into a sub-graph, then all sub-graphs launch concurrently — the
     multi-tenant CUDA-graph capture that iter 1/2 couldn't do.
+    `sched_window_size` controls how many FIFO-polled triggers the C++ proxy
+    can consider before dispatching one by tenant policy.
     """
     qos_classes = qos_classes or [QoSClass.STANDARD] * num_tenants
     caps = list(bandwidth_caps_bps) if bandwidth_caps_bps else [0] * num_tenants
@@ -427,7 +430,8 @@ def run_multi_tenant_cpp(scenario_name, num_tenants, sizes, niter,
     # re-creating the proxy_service per size is still the cleanest way to
     # keep the running count under 64 across the full benchmark matrix.
     for nelems in sizes:
-        proxy_service = TenantAwareProxyService(mode=mode)
+        proxy_service = TenantAwareProxyService(
+            mode=mode, scheduling_window_size=sched_window_size)
         for i in range(num_tenants):
             register_tenant_on(proxy_service, i + 1, qos_classes[i],
                                weights_eff[i], int(caps[i]), 0)
@@ -810,10 +814,14 @@ def main():
     parser.add_argument("--rate-cap-gbps", type=float, default=30.0,
                         help="tenant-2 bandwidth cap in GB/s for rate_limited "
                              "scenario (default 30)")
+    parser.add_argument("--sched-window-size", type=int, default=5,
+                        help="TenantAwareProxyService scheduling window size "
+                             "for cpp_mt scenarios (default 5)")
     parser.add_argument("--out", type=str, default="/root/ccl/results/mt_bench.csv")
     parser.add_argument("--dtype", type=str, default="fp32",
                         choices=["fp16", "fp32"])
     args = parser.parse_args()
+    args.sched_window_size = max(1, int(args.sched_window_size))
 
     comm = MPI.COMM_WORLD
     rank = comm.rank
@@ -906,33 +914,40 @@ def main():
     if "cpp_mt_fair" in scenarios:
         if rank == 0:
             print(f"\n--- scenario: cpp_mt_fair (C++ in-proxy, FAIR, "
-                  f"cuda_graph={use_graph}) ---", flush=True)
+                  f"cuda_graph={use_graph}, "
+                  f"sched_window={args.sched_window_size}) ---", flush=True)
         run_multi_tenant_cpp("cpp_mt_fair", 2, sizes, args.niter,
                              group, nccl_comm, dtype, comm, rank, results, run_id,
                              mode=PolicyMode.FAIR, use_cuda_graph=use_graph,
-                             nranks_per_node=n_per_node)
+                             nranks_per_node=n_per_node,
+                             sched_window_size=args.sched_window_size)
 
     if "cpp_mt_priority" in scenarios:
         if rank == 0:
             print(f"\n--- scenario: cpp_mt_priority (C++ in-proxy, STRICT_PRIORITY, "
-                  f"cuda_graph={use_graph}) ---", flush=True)
+                  f"cuda_graph={use_graph}, "
+                  f"sched_window={args.sched_window_size}) ---", flush=True)
         run_multi_tenant_cpp("cpp_mt_priority", 3, sizes, args.niter,
                              group, nccl_comm, dtype, comm, rank, results, run_id,
                              mode=PolicyMode.STRICT_PRIORITY,
                              qos_classes=[QoSClass.PREMIUM, QoSClass.BEST_EFFORT,
                                           QoSClass.BEST_EFFORT],
                              use_cuda_graph=use_graph,
-                             nranks_per_node=n_per_node)
+                             nranks_per_node=n_per_node,
+                             sched_window_size=args.sched_window_size)
 
     if "cpp_mt_weighted" in scenarios:
         if rank == 0:
-            print(f"\n--- scenario: cpp_mt_weighted (C++ in-proxy, FAIR weights 1:3) ---",
+            print(f"\n--- scenario: cpp_mt_weighted "
+                  f"(C++ in-proxy, FAIR weights 1:3, "
+                  f"sched_window={args.sched_window_size}) ---",
                   flush=True)
         run_multi_tenant_cpp("cpp_mt_weighted_1to3", 2, sizes, args.niter,
                              group, nccl_comm, dtype, comm, rank, results, run_id,
                              mode=PolicyMode.FAIR, weights=[1, 3],
                              use_cuda_graph=use_graph,
-                             nranks_per_node=n_per_node)
+                             nranks_per_node=n_per_node,
+                             sched_window_size=args.sched_window_size)
 
     if "cpp_mt_rate_limited" in scenarios:
         # Iter 6: prove the C++ token bucket actually caps tenant 2's
@@ -943,14 +958,16 @@ def main():
         cap_bps_cpp = int(args.rate_cap_gbps * 1e9)
         if rank == 0:
             print(f"\n--- scenario: cpp_mt_rate_limited "
-                  f"(C++ in-proxy, FAIR, tenant 2 capped @ {args.rate_cap_gbps:g} GB/s) ---",
+                  f"(C++ in-proxy, FAIR, tenant 2 capped @ {args.rate_cap_gbps:g} GB/s, "
+                  f"sched_window={args.sched_window_size}) ---",
                   flush=True)
         run_multi_tenant_cpp("cpp_mt_rate_limited", 2, sizes, args.niter,
                              group, nccl_comm, dtype, comm, rank, results, run_id,
                              mode=PolicyMode.FAIR,
                              bandwidth_caps_bps=[0, cap_bps_cpp],
                              use_cuda_graph=use_graph,
-                             nranks_per_node=n_per_node)
+                             nranks_per_node=n_per_node,
+                             sched_window_size=args.sched_window_size)
 
     if "priority" in scenarios:
         if rank == 0:

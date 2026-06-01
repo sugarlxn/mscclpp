@@ -89,12 +89,21 @@ MSCCLPP_API_CPP ProxyService::ProxyService(int fifoSize) {
     progressFlushes();
     if (extraProgressHook_) extraProgressHook_();
   });
+  proxy_->pimpl_->setIdleProgressHandler([this]() {
+    if (idleProgressHook_) idleProgressHook_();
+  });
 }
 
 MSCCLPP_API_CPP void ProxyService::setExtraProgressHook(std::function<void()> hook) {
   // Stored on `this`; the proxy thread's progressHandler closure already
   // captures `this` and tests for emptiness on each call (see ctor above).
   extraProgressHook_ = std::move(hook);
+}
+
+MSCCLPP_API_CPP void ProxyService::setIdleProgressHook(std::function<void()> hook) {
+  // Stored on `this`; the proxy thread's idleProgressHandler closure already
+  // captures `this` and tests for emptiness on each idle poll (see ctor above).
+  idleProgressHook_ = std::move(hook);
 }
 
 MSCCLPP_API_CPP SemaphoreId ProxyService::buildAndAddSemaphore(Communicator& communicator,

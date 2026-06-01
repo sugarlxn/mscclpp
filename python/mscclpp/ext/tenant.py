@@ -634,7 +634,8 @@ def _cpp_mode(mode: PolicyMode):
 
 
 def TenantAwareProxyService(mode: PolicyMode = PolicyMode.SINGLE_PASSTHROUGH,
-                            fifo_size: int = 128):
+                            fifo_size: int = 128,
+                            scheduling_window_size: int = 5):
     """Construct a C++ TenantAwareProxyService — drop-in replacement for
     mscclpp.ProxyService with per-tenant scheduling.
 
@@ -642,7 +643,8 @@ def TenantAwareProxyService(mode: PolicyMode = PolicyMode.SINGLE_PASSTHROUGH,
     anywhere a CppProxyService is expected (e.g. CommGroup.make_port_channels).
     """
     from mscclpp._mscclpp import CppTenantAwareProxyService
-    svc = CppTenantAwareProxyService(_cpp_mode(mode), fifo_size)
+    window = max(1, int(scheduling_window_size))
+    svc = CppTenantAwareProxyService(_cpp_mode(mode), fifo_size, window)
     return svc
 
 

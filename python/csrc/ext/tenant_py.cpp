@@ -48,8 +48,9 @@ void register_tenant(nb::module_& m) {
   // TenantAwareProxyService derives from ProxyService, so the BaseProxyService
   // parent allows polymorphism with the existing CppBaseProxyService binding.
   nb::class_<TenantAwareProxyService, ProxyService>(m, "CppTenantAwareProxyService")
-      .def(nb::init<PolicyMode, int>(), nb::arg("mode") = PolicyMode::SinglePassthrough,
-           nb::arg("fifo_size") = DEFAULT_FIFO_SIZE)
+      .def(nb::init<PolicyMode, int, uint32_t>(), nb::arg("mode") = PolicyMode::SinglePassthrough,
+           nb::arg("fifo_size") = DEFAULT_FIFO_SIZE,
+           nb::arg("scheduling_window_size") = DEFAULT_SCHEDULING_WINDOW_SIZE)
       .def("update_tenant", &TenantAwareProxyService::updateTenant, nb::arg("ctx"), nb::arg("budget"))
       .def("register_tenant", &TenantAwareProxyService::registerTenant, nb::arg("tenant_id"), nb::arg("qos"),
            nb::arg("weight") = 1, nb::arg("bandwidth_max_bps") = uint64_t{0}, nb::arg("burst_bytes") = uint64_t{0})

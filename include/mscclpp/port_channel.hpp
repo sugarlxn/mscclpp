@@ -112,6 +112,11 @@ class ProxyService : public BaseProxyService {
   /// May be called multiple times — only the most recent hook is kept.
   void setExtraProgressHook(std::function<void()> hook);
 
+  /// Register a hook that the proxy thread calls only when the FIFO head is
+  /// not ready. Used by tenant scheduling windows to drain partial windows
+  /// without preventing active windows from filling.
+  void setIdleProgressHook(std::function<void()> hook);
+
   /// Start the proxy service.
   /// @param blocking Whether to block until the proxy thread has started (default: false).
   void startProxy(bool blocking = false);
@@ -149,6 +154,10 @@ class ProxyService : public BaseProxyService {
   // Set via setExtraProgressHook(); the proxy thread's progressHandler
   // calls progressFlushes() then this hook if non-empty.
   std::function<void()> extraProgressHook_;
+
+  // MT-MSCCL++: idle hook called only when the proxy poll loop finds no ready
+  // FIFO trigger. Used for draining partial tenant scheduling windows.
+  std::function<void()> idleProgressHook_;
 };
 
 /// Port channel without specifying source/destination memory regions.

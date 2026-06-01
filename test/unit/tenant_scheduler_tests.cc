@@ -101,7 +101,7 @@ inline ProxyFifoContext makeCtx(uint64_t fifoPos) {
 // for B is permanently broken.
 TEST(TenantSchedulerDispatchOrderTest, FirstTriggerFromNewTenantIsNotBypassedWithoutActiveMaskUpdate) {
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   uint64_t pos = 100;
   auto P = [&](uint32_t tid, uint32_t sem, uint32_t type) {
     return h(makeTrigger(tid, sem, type), makeCtx(pos++));
@@ -135,7 +135,7 @@ TEST(TenantSchedulerDispatchOrderTest, FirstTriggerFromNewTenantIsNotBypassedWit
 // would let TriggerSync overtake the earlier TriggerData on the same conn.
 TEST(TenantSchedulerPerConnOrderingTest, SameConnectionFifoPreservedAcrossTenants) {
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   uint64_t pos = 10;
   auto P = [&](uint32_t tid, uint32_t sem, uint32_t type) {
     return h(makeTrigger(tid, sem, type), makeCtx(pos++));
@@ -172,7 +172,7 @@ TEST(TenantSchedulerPerConnOrderingTest, SameConnectionFifoPreservedAcrossTenant
 // from different tenants are unconstrained.
 TEST(TenantSchedulerPerConnOrderingTest, DifferentConnectionsMayReorder) {
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority, 1);
   uint64_t pos = 200;
   auto P = [&](uint32_t tid, uint32_t sem, uint32_t type) {
     return h(makeTrigger(tid, sem, type), makeCtx(pos++));
@@ -205,7 +205,7 @@ TEST(TenantSchedulerPerConnOrderingTest, DifferentConnectionsMayReorder) {
 // the traffic against DEFAULT_TENANT.
 TEST(TenantSchedulerFailOpenTest, UnregisteredTenantReattributedToDefault) {
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   uint64_t pos = 300;
   auto P = [&](uint32_t tid, uint32_t sem, uint32_t type) {
     return h(makeTrigger(tid, sem, type), makeCtx(pos++));
@@ -226,7 +226,7 @@ TEST(TenantSchedulerFailOpenTest, UnregisteredTenantReattributedToDefault) {
 
 TEST(TenantSchedulerDebugCountersTest, DrrPicksAndDispatchedCountersIncrease) {
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::Standard, 3, 0, 0, 0, 0}, {0, 0, 0});
 
@@ -248,7 +248,7 @@ TEST(TenantSchedulerDebugCountersTest, DrrPicksAndDispatchedCountersIncrease) {
 
 TEST(TenantSchedulerDebugCountersTest, StrictPriorityPickCounterIncreases) {
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority, 1);
   h.updateTenant({1, QoSClass::Premium, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::BestEffort, 1, 0, 0, 0, 0}, {0, 0, 0});
 
@@ -264,7 +264,7 @@ TEST(TenantSchedulerDebugCountersTest, StrictPriorityPickCounterIncreases) {
 
 TEST(TenantSchedulerDebugCountersTest, TokenBucketWaitCounterIncreasesWithoutDispatch) {
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 1, 0}, {/*bytes_per_second=*/1, /*burst_bytes=*/1, 0});
 
   h.enqueueForTest(makeTrigger(1, 30, TriggerData, 4096), makeCtx(1));
@@ -284,7 +284,7 @@ TEST(TenantSchedulerDebugCountersTest, TokenBucketWaitCounterIncreasesWithoutDis
 // arrived, would bypass) past trigger N (still in queue from earlier).
 TEST(TenantSchedulerBypassTest, DoesNotBypassWhilePendingQueueIsNonEmpty) {
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   uint64_t pos = 400;
   auto P = [&](uint32_t tid, uint32_t sem, uint32_t type) {
     return h(makeTrigger(tid, sem, type), makeCtx(pos++));
@@ -301,6 +301,94 @@ TEST(TenantSchedulerBypassTest, DoesNotBypassWhilePendingQueueIsNonEmpty) {
     P((i % 2) + 1, 0, TriggerData);
   }
   EXPECT_LE(h.pendingCountForTest(), 11u);
+}
+
+// -------- 5b) Scheduling window: collect several FIFO-polled triggers before
+// applying tenant policy. This is what lets high-priority tenants overtake
+// lower-priority tenants across independent connections.
+
+TEST(TenantSchedulerWindowTest, StrictPriorityPicksHighPriorityWithinFullWindow) {
+  Recorder rec;
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority, 2);
+  h.updateTenant({1, QoSClass::BestEffort, 1, 0, 0, 0, 0}, {0, 0, 0});
+  h.updateTenant({2, QoSClass::Realtime, 1, 0, 0, 0, 0}, {0, 0, 0});
+
+  // First trigger is a single-tenant fast-path bypass that marks tenant 1 active.
+  h(makeTrigger(1, 1, TriggerData), makeCtx(500));
+  ASSERT_EQ(rec.records().size(), 1u);
+  EXPECT_EQ(rec.records()[0].tenantId, 1u);
+
+  // Tenant 2 enters the window but does not dispatch until the window fills.
+  h(makeTrigger(2, 2, TriggerData), makeCtx(501));
+  EXPECT_EQ(rec.records().size(), 1u);
+  EXPECT_EQ(h.pendingCountForTest(), 1u);
+
+  // Filling the window should dispatch tenant 2 first because it is Realtime.
+  h(makeTrigger(1, 3, TriggerData), makeCtx(502));
+  ASSERT_EQ(rec.records().size(), 2u);
+  EXPECT_EQ(rec.records()[1].tenantId, 2u);
+  EXPECT_EQ(rec.records()[1].semaphoreId, 2u);
+  EXPECT_EQ(h.pendingCountForTest(), 1u);
+}
+
+TEST(TenantSchedulerWindowTest, IdleTickDrainsPartialWindow) {
+  Recorder rec;
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority, 5);
+  h.updateTenant({1, QoSClass::BestEffort, 1, 0, 0, 0, 0}, {0, 0, 0});
+  h.updateTenant({2, QoSClass::Realtime, 1, 0, 0, 0, 0}, {0, 0, 0});
+
+  h(makeTrigger(1, 1, TriggerData), makeCtx(600));  // single-tenant bypass
+  h(makeTrigger(2, 2, TriggerData), makeCtx(601));  // pending, window not full
+
+  ASSERT_EQ(rec.records().size(), 1u);
+  EXPECT_EQ(h.pendingCountForTest(), 1u);
+
+  h.tickProgress();
+
+  ASSERT_EQ(rec.records().size(), 2u);
+  EXPECT_EQ(rec.records()[1].tenantId, 2u);
+  EXPECT_EQ(h.pendingCountForTest(), 0u);
+}
+
+TEST(TenantSchedulerWindowTest, SameConnectionOrderBeatsStrictPriorityWithinWindow) {
+  Recorder rec;
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority, 2);
+  h.updateTenant({1, QoSClass::BestEffort, 1, 0, 0, 0, 0}, {0, 0, 0});
+  h.updateTenant({2, QoSClass::Realtime, 1, 0, 0, 0, 0}, {0, 0, 0});
+
+  // Prime both tenants active, then drain the one queued priming trigger.
+  h(makeTrigger(1, 1, TriggerData), makeCtx(700));
+  h(makeTrigger(2, 2, TriggerData), makeCtx(701));
+  h.tickProgress();
+  ASSERT_EQ(h.pendingCountForTest(), 0u);
+  const size_t base = rec.records().size();
+
+  // Same semaphoreId: tenant 2 is higher priority but cannot pass tenant 1.
+  h(makeTrigger(1, 7, TriggerData), makeCtx(702));
+  h(makeTrigger(2, 7, TriggerData), makeCtx(703));
+
+  ASSERT_EQ(rec.records().size(), base + 1);
+  EXPECT_EQ(rec.records()[base].tenantId, 1u);
+  EXPECT_EQ(rec.records()[base].semaphoreId, 7u);
+
+  h.tickProgress();
+  ASSERT_EQ(rec.records().size(), base + 2);
+  EXPECT_EQ(rec.records()[base + 1].tenantId, 2u);
+  EXPECT_EQ(rec.records()[base + 1].semaphoreId, 7u);
+}
+
+TEST(TenantSchedulerWindowTest, WindowSizeOneDispatchesEachSlowPathEnqueue) {
+  Recorder rec;
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
+  h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
+  h.updateTenant({2, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
+
+  h(makeTrigger(1, 1, TriggerData), makeCtx(800));  // single-tenant bypass
+  ASSERT_EQ(rec.records().size(), 1u);
+
+  h(makeTrigger(2, 2, TriggerData), makeCtx(801));  // slow path, window size 1
+  ASSERT_EQ(rec.records().size(), 2u);
+  EXPECT_EQ(h.pendingCountForTest(), 0u);
 }
 
 // -------- 6) TriggerSync flush boundary uses push-time fifoPos (design.md §5.7).
@@ -325,7 +413,7 @@ TEST(TriggerSyncFifoPosTest, DispatchedCtxMatchesPushTimePos) {
     }
   } rec;
 
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
 

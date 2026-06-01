@@ -157,7 +157,7 @@ struct Recorder {
 void test_dispatch_order() {
   std::printf("[test] dispatch order (new tenant first trigger not bypassed)\n");
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   uint64_t pos = 100;
@@ -174,7 +174,7 @@ void test_dispatch_order() {
 void test_per_conn_ordering() {
   std::printf("[test] per-connection FIFO preserved across tenants\n");
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   uint64_t pos = 10;
@@ -204,7 +204,7 @@ void test_per_conn_ordering() {
 void test_trigger_sync_fifopos_preserved() {
   std::printf("[test] TriggerSync ctx.fifoPos preserved under scheduler delay\n");
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   // TriggerSync from tenant 1 at fifoPos=999; then 5 Data from tenant 2 at later positions.
@@ -228,7 +228,7 @@ void test_trigger_sync_fifopos_preserved() {
 void test_fail_open() {
   std::printf("[test] fail-open for unregistered tenants\n");
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   // Tenant 5 is not registered — should fail-open to DEFAULT_TENANT and be delivered.
   CHECK(h.unregisteredTriggerCount() == 0, "counter starts at 0");
@@ -255,7 +255,7 @@ void test_fail_open() {
 void test_drr_weighted() {
   std::printf("[test] DRR honors weight ratio (1:3, queues piled across tenants)\n");
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::Standard, 3, 0, 0, 0, 0}, {0, 0, 0});
 
@@ -312,7 +312,7 @@ void test_drr_weighted() {
 void test_priority_aging() {
   std::printf("[test] StrictPriority aging promotes long-waiting BestEffort\n");
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority, 1);
   h.updateTenant({1, QoSClass::Premium, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::BestEffort, 1, 0, 0, 0, 0}, {0, 0, 0});
 
@@ -371,7 +371,7 @@ void test_priority_aging() {
 void test_drr_weighted_with_prefilled_queues() {
   std::printf("[test] DRR weight 1:3 — direct pickDrr from pre-filled queues\n");
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::Standard, 3, 0, 0, 0, 0}, {0, 0, 0});
 
@@ -409,7 +409,7 @@ void test_drr_weighted_with_prefilled_queues() {
 void test_drr_weighted_different_conn_keys() {
   std::printf("[test] DRR weight 1:3 — different conn keys (ratio should bind)\n");
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::Standard, 3, 0, 0, 0, 0}, {0, 0, 0});
 
@@ -457,7 +457,7 @@ void test_drr_weighted_different_conn_keys() {
 void test_progress_hook_no_starve() {
   std::printf("[test] tickProgress drains when no new triggers arrive\n");
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::Standard, 1, 0, 0, 0, 0}, {0, 0, 0});
 
@@ -482,7 +482,7 @@ void test_progress_hook_no_starve() {
 void test_progress_hook_bucket_dry_then_refill() {
   std::printf("[test] tickProgress drains rate-limited tenant after refill\n");
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fair, 1);
   // Tenant 1: 10 MB/s refill, 4 KB burst. Each trigger is 4 KB → first one
   // empties the bucket; the rest wait for refill (~400 us per refill).
   h.updateTenant({1, QoSClass::Standard, 1, 0, 0, 0, 0},
@@ -534,7 +534,7 @@ void test_progress_hook_bucket_dry_then_refill() {
 void test_aging_real_not_bypass() {
   std::printf("[test] aging promotes long-waiting BestEffort over Premium (no bypass)\n");
   Recorder rec;
-  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority);
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority, 1);
   h.updateTenant({1, QoSClass::Premium, 1, 0, 0, 0, 0}, {0, 0, 0});
   h.updateTenant({2, QoSClass::BestEffort, 1, 0, 0, 0, 0}, {0, 0, 0});
 

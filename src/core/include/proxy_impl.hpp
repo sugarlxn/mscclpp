@@ -23,6 +23,7 @@ struct Proxy::Impl {
   ContextProxyHandler contextHandler;  // optional; preferred when non-empty
   std::function<void()> threadInit;
   std::function<void()> progressHandler;
+  std::function<void()> idleProgressHandler;
   std::shared_ptr<Fifo> fifo;
   std::atomic_bool threadStarted;
   std::thread service;
@@ -37,6 +38,11 @@ struct Proxy::Impl {
 
   // Must be called before start() — the proxy thread captures progressHandler at start time.
   void setProgressHandler(std::function<void()> h) { progressHandler = std::move(h); }
+
+  // Must be called before start() — the proxy thread captures idleProgressHandler at start time.
+  // Runs only when the FIFO head is not ready, giving delayed schedulers a chance
+  // to drain partial windows without preventing active windows from filling.
+  void setIdleProgressHandler(std::function<void()> h) { idleProgressHandler = std::move(h); }
 
   // Must be called before start(). When set, the proxy thread captures
   // fifoPos = fifo->tail() AT POLL TIME (before pop()) and dispatches via
