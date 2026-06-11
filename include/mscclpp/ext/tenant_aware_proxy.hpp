@@ -250,15 +250,17 @@ class TenantAwareProxyHandler {
     uint32_t oldMask = activeMask_.fetch_or(uint32_t{1} << tid, std::memory_order_acq_rel);
     uint32_t mask = oldMask | (uint32_t{1} << tid);
 
-    // (4) Single-tenant bypass: zero scheduling overhead, BUT only when the
+    // (4) Single-tenant bypass(Fast path): zero scheduling overhead, BUT only when the
     //     scheduler has no in-flight work. If we bypassed while queues still
     //     held older triggers we would reorder relative to FIFO push order.
+    //NOTE: 当mask只有一个bit = 1, 则此时只有一个tenant活跃
     if (__builtin_popcount(mask) <= 1) {
       bool queuesEmpty;
       {
         std::lock_guard<std::mutex> g(mu_);
         queuesEmpty = allQueuesEmptyLocked();
       }
+      //NOTE：并且 当tenant队列为空时， 进入bypass 路径
       if (queuesEmpty) {
         // Bypass: pass the ORIGINAL ctx (poll-time fifoPos) straight through.
         return inner_(trig, ctx);
@@ -615,7 +617,8 @@ class TenantAwareProxyHandler {
   PolicyMode mode_;
   uint32_t schedulingWindowSize_;
   mutable std::mutex mu_;
-  std::array<std::deque<PendingTrigger>, MAX_TENANTS> queues_{};
+  //NOTE: pre-tenant queue, slow path for multi tenant dispatch. 
+  std::array<std::deque<PendingTrigger>, MAX_TENANTS> queues_{}; 
   // Per-connection FIFO of pending seq numbers — order of arrival on each
   // semaphoreId. Heterogeneous map so we only pay for actually-used keys.
   std::unordered_map<uint32_t, std::deque<uint64_t>> connQueues_;
