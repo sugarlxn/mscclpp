@@ -69,12 +69,14 @@ void worker(int rank, int gpuId, const std::string& ipPort, mscclpp::Transport t
   log("Rank ", myRank, " (GPU ", gpuId, "): Preparing for tests ...");
 
   // Build a connection and a semaphore
+  //NOTE: 1. host setup
   auto bootstrap = std::make_shared<mscclpp::TcpBootstrap>(myRank, nRanks);
   bootstrap->initialize(ipPort);
   mscclpp::Communicator comm(bootstrap);
   auto conn = comm.connect({transport, {mscclpp::DeviceType::GPU, gpuId}}, remoteRank).get();
   auto sema = comm.buildSemaphore(conn, remoteRank).get();
 
+  //NOTE: 2. 注册内存并交换内存句柄
   mscclpp::GpuBuffer buffer(bufferBytes);
   mscclpp::RegisteredMemory localRegMem = comm.registerMemory(buffer.data(), buffer.bytes(), transport);
 
@@ -82,12 +84,14 @@ void worker(int rank, int gpuId, const std::string& ipPort, mscclpp::Transport t
   auto remoteRegMemFuture = comm.recvMemory(remoteRank);
   mscclpp::RegisteredMemory remoteRegMem = remoteRegMemFuture.get();
 
+  //NOTE: 3. 通过Proxyservice 构造PortChannel，并获取设备句柄
   mscclpp::ProxyService proxyService;
   mscclpp::SemaphoreId semaId = proxyService.addSemaphore(sema);
   mscclpp::MemoryId localMemId = proxyService.addMemory(localRegMem);
   mscclpp::MemoryId remoteMemId = proxyService.addMemory(remoteRegMem);
   mscclpp::PortChannel portChan = proxyService.portChannel(semaId, remoteMemId, localMemId);
 
+  //NOTE: 4. 拷贝DeviceHandle 到GPU
   auto portChanHandle = portChan.deviceHandle();
 
   void* devHandle;
@@ -181,6 +185,7 @@ mscclpp::Transport parseTransport(const std::string& transportStr) {
 }
 
 int main(int argc, char** argv) {
+  //NOTE 方法1 ./bidir_port_channel 会自动spawn两个子进程，分别作为rank 0和rank 1运行worker函数
   if (argc == 1) {
     int pid0 = spawn_process([]() { worker(0, 0, "lo:127.0.0.1:" PORT_NUMBER, mscclpp::Transport::CudaIpc); });
     int pid1 = spawn_process([]() { worker(1, 1, "lo:127.0.0.1:" PORT_NUMBER, mscclpp::Transport::CudaIpc); });
@@ -201,6 +206,7 @@ int main(int argc, char** argv) {
     log("Succeed!");
     return 0;
   } else if (argc == 5) {
+    //NOTE： 方法2 直接运行 ./bidir_port_channel <ip_port> <rank> <gpu_id> <transport> 来运行单个worker函数，用户需要自己启动两个进程并传入不同的参数
     std::string ipPort = argv[1];
     int rank = std::atoi(argv[2]);
     int gpuId = std::atoi(argv[3]);
