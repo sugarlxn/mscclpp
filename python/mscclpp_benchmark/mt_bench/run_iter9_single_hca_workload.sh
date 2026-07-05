@@ -10,8 +10,7 @@ mpirun --allow-run-as-root \
   --mca btl_tcp_if_include 172.16.8.0/22 \
   --mca oob_tcp_if_include 172.16.8.0/22 \
   -x PATH -x LD_LIBRARY_PATH -x PYTHONPATH -x MTCCL_K_STREAMS \
-  -x NCCL_IB_DISABLE=1 \
-  -x MSCCLPP_HCA_DEVICES=mlx5_0,mlx5_0 \
+  -x MSCCLPP_HCA_DEVICES="=mlx5_0:1,=mlx5_1:1" \
   python -m mscclpp_benchmark.mt_bench.run_bench \
     --dtype fp16 \
     --sizes 6144,98304,1572864,25165824,100663296,201326592,402653184 \

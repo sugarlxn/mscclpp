@@ -165,6 +165,87 @@ class MscclppAllReduce2:
                 yield nblocks, block_size
 
 
+class MscclppAllReduce7:
+    """Topology-specialized 4-GPU paired allreduce.
+
+    This is intended for single-node systems where ranks 0/1 and 2/3 are fast
+    local pairs, while traffic between the two pairs crosses a slower path.
+    """
+
+    def __init__(
+        self,
+        group: CommGroup,
+        memory: cp.ndarray,
+        block_size: int = 1024,
+        nblocks: int = 80,
+    ):
+        if group.nranks != 4:
+            raise RuntimeError("MscclppAllReduce7 only supports exactly 4 ranks")
+
+        self.group = group
+        self.memory = memory
+        remote_nghrs = list(range(self.group.nranks))
+        remote_nghrs.remove(self.group.my_rank)
+
+        self.group.barrier()
+        self.connections = self.group.make_connection(remote_nghrs, Transport.CudaIpc)
+        type_str = type_to_str(memory.dtype)
+        self.memory_channels = self.group.make_memory_channels(self.memory, self.connections)
+        self.send_scratch = GpuBuffer(self.memory.size, dtype=self.memory.dtype)
+        self.recv_scratch = GpuBuffer(self.memory.size, dtype=self.memory.dtype)
+        self.registered_recv_scratch = self.group.register_local_memory(self.recv_scratch, self.connections)
+        self.scratch_channels = self.group.make_memory_channels_with_scratch(
+            self.send_scratch, self.registered_recv_scratch, self.connections
+        )
+
+        file_dir = os.path.dirname(os.path.abspath(__file__))
+        self.kernel = KernelBuilder(
+            file="allreduce.cu",
+            kernel_name="allreduce7_pair_hier",
+            file_dir=file_dir,
+            macro_dict={"TYPE": type_str},
+        ).get_compiled_kernel()
+        self.device_handles = []
+        self.scratch_device_handles = []
+        for rank in range(self.group.nranks):
+            if rank != self.group.my_rank:
+                self.device_handles.append(self.memory_channels[rank].device_handle().raw)
+                self.scratch_device_handles.append(self.scratch_channels[rank].device_handle().raw)
+        self.device_handles_cp = cp.asarray(memoryview(b"".join(self.device_handles)), dtype=cp.uint8)
+        self.scratch_device_handles_cp = cp.asarray(
+            memoryview(b"".join(self.scratch_device_handles)), dtype=cp.uint8
+        )
+
+        self.set_params(nblocks, block_size)
+
+    def __call__(self, stream):
+        self.kernel.launch_kernel(self.params, self.nblocks, self.block_size, 0, stream)
+        return self.memory
+
+    def set_params(self, nblocks, block_size):
+        self.nblocks = nblocks
+        self.block_size = block_size
+        self.params = b""
+        self.params += pack(
+            self.device_handles_cp,
+            self.scratch_device_handles_cp,
+            self.memory,
+            self.send_scratch,
+            self.recv_scratch,
+            self.group.my_rank,
+            bytes(4),  # padding before size_t
+            ctypes.c_size_t(self.memory.size),
+        )
+
+    def auto_tune(self):
+        nblocks_to_try = [32, 48, 64, 80, 96, 108, 128]
+        block_size_to_try = [512, 1024]
+        for nblocks in nblocks_to_try:
+            for block_size in block_size_to_try:
+                self.set_params(nblocks, block_size)
+                yield nblocks, block_size
+
+
 class MscclppAllReduce3:
     def __init__(
         self,

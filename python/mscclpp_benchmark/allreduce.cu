@@ -296,6 +296,128 @@ extern "C" __global__ void __launch_bounds__(1024, 1)
 }
 
 // -------------------------------------------
+// AllReduce7
+// Single-node 4-GPU paired topology:
+//   rank 0 <-> rank 1 via fast local link
+//   rank 2 <-> rank 3 via fast local link
+//   pair leaders 0 and 2 exchange over the slower cross-pair link
+// -------------------------------------------
+
+__forceinline__ __device__ int channelIndexForRank(int rank, int remoteRank) {
+  return remoteRank < rank ? remoteRank : remoteRank - 1;
+}
+
+__forceinline__ __device__ void reduceFullBufferFromMemChan(mscclpp::MemoryChannelDeviceHandle& memChan, TYPE* buff,
+                                                            size_t nelems, int tid, int nThreads) {
+  const size_t totalBytes = nelems * sizeof(TYPE);
+  const size_t nInt4 = totalBytes / sizeof(int4);
+  int4* buff4 = reinterpret_cast<int4*>(buff);
+
+  for (size_t idx = tid; idx < nInt4; idx += nThreads) {
+    int4 remote = memChan.read<int4>(idx);
+    buff4[idx] = add_vectors<TYPE>(buff4[idx], remote);
+  }
+
+  const size_t processedElems = (nInt4 * sizeof(int4)) / sizeof(TYPE);
+  for (size_t idx = processedElems + tid; idx < nelems; idx += nThreads) {
+    TYPE remote = memChan.read<TYPE>(idx);
+    buff[idx] = add_elements<TYPE>(buff[idx], remote);
+  }
+}
+
+__forceinline__ __device__ void copyFullBufferLocal(TYPE* dst, const TYPE* src, size_t nelems, int tid, int nThreads) {
+  const size_t totalBytes = nelems * sizeof(TYPE);
+  const size_t nInt4 = totalBytes / sizeof(int4);
+  int4* dst4 = reinterpret_cast<int4*>(dst);
+  const int4* src4 = reinterpret_cast<const int4*>(src);
+
+  for (size_t idx = tid; idx < nInt4; idx += nThreads) {
+    dst4[idx] = src4[idx];
+  }
+
+  const size_t processedElems = (nInt4 * sizeof(int4)) / sizeof(TYPE);
+  for (size_t idx = processedElems + tid; idx < nelems; idx += nThreads) {
+    dst[idx] = src[idx];
+  }
+}
+
+__forceinline__ __device__ void reduceFullBufferLocal(TYPE* dst, const TYPE* src, size_t nelems, int tid,
+                                                      int nThreads) {
+  const size_t totalBytes = nelems * sizeof(TYPE);
+  const size_t nInt4 = totalBytes / sizeof(int4);
+  int4* dst4 = reinterpret_cast<int4*>(dst);
+  const int4* src4 = reinterpret_cast<const int4*>(src);
+
+  for (size_t idx = tid; idx < nInt4; idx += nThreads) {
+    dst4[idx] = add_vectors<TYPE>(dst4[idx], src4[idx]);
+  }
+
+  const size_t processedElems = (nInt4 * sizeof(int4)) / sizeof(TYPE);
+  for (size_t idx = processedElems + tid; idx < nelems; idx += nThreads) {
+    dst[idx] = add_elements<TYPE>(dst[idx], src[idx]);
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(1024, 1)
+    allreduce7_pair_hier(mscclpp::MemoryChannelDeviceHandle* memChans,
+                         mscclpp::MemoryChannelDeviceHandle* scratchChans, TYPE* buff, TYPE* sendScratch,
+                         TYPE* recvScratch, int rank, size_t nelems) {
+  constexpr int worldSize = 4;
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  const int nThreads = blockDim.x * gridDim.x;
+
+  const int localPeer = rank ^ 1;
+  const bool isLeader = (rank == 0 || rank == 2);
+  const int remoteLeader = rank < 2 ? 2 : 0;
+  const int localPeerChan = channelIndexForRank(rank, localPeer);
+  const int remoteLeaderChan = channelIndexForRank(rank, remoteLeader);
+
+  // Phase 1: both GPUs in each NVLink pair reduce the full local-pair buffer.
+  if (tid == 0) {
+    memChans[localPeerChan].relaxedSignal();
+    memChans[localPeerChan].relaxedWait();
+  }
+  deviceSyncer.sync(gridDim.x);
+  copyFullBufferLocal(sendScratch, buff, nelems, tid, nThreads);
+  deviceSyncer.sync(gridDim.x);
+  reduceFullBufferFromMemChan(memChans[localPeerChan], sendScratch, nelems, tid, nThreads);
+  deviceSyncer.sync(gridDim.x);
+
+  // Phase 2: pair leaders exchange stable pair-sum scratch buffers across
+  // the slower SYS path, then reduce the remote pair sum into their output.
+  if (isLeader) {
+    copyFullBufferLocal(buff, sendScratch, nelems, tid, nThreads);
+    deviceSyncer.sync(gridDim.x);
+    scratchChans[remoteLeaderChan].put(0, nelems * sizeof(TYPE), tid, nThreads);
+    deviceSyncer.sync(gridDim.x);
+    if (tid == 0) {
+      scratchChans[remoteLeaderChan].signal();
+      scratchChans[remoteLeaderChan].wait();
+    }
+    deviceSyncer.sync(gridDim.x);
+    reduceFullBufferLocal(buff, recvScratch, nelems, tid, nThreads);
+    deviceSyncer.sync(gridDim.x);
+  } else {
+    deviceSyncer.sync(gridDim.x);
+    deviceSyncer.sync(gridDim.x);
+    deviceSyncer.sync(gridDim.x);
+  }
+
+  // Phase 3: leaders publish the global sum back to their NVLink peer.
+  if (isLeader) {
+    if (tid == 0) {
+      memChans[localPeerChan].signal();
+    }
+  } else {
+    if (tid == 0) {
+      memChans[localPeerChan].relaxedWait();
+    }
+    deviceSyncer.sync(gridDim.x);
+    memChans[localPeerChan].get(0, nelems * sizeof(TYPE), tid, nThreads);
+  }
+}
+
+// -------------------------------------------
 // AllReduce3
 // -------------------------------------------
 

@@ -36,7 +36,7 @@ import ipaddress
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mscclpp_op import (  # noqa: E402
     MscclppAllReduce1, MscclppAllReduce2, MscclppAllReduce3, MscclppAllReduce4,
-    MscclppAllReduce6,
+    MscclppAllReduce6, MscclppAllReduce7,
 )
 from nccl_op import NcclAllReduce  # noqa: E402
 
@@ -65,6 +65,20 @@ def is_routable(ip):
 
 
 def get_net_iface():
+    requested = os.environ.get("MSCCLPP_SOCKET_IFNAME", "").strip()
+    if requested:
+        addrs = ni.ifaddresses(requested) if requested in ni.interfaces() else {}
+        if ni.AF_INET not in addrs:
+            raise RuntimeError(
+                f"MSCCLPP_SOCKET_IFNAME={requested} has no IPv4 address"
+            )
+        for a in addrs[ni.AF_INET]:
+            if is_routable(a["addr"]):
+                return requested, a["addr"]
+        raise RuntimeError(
+            f"MSCCLPP_SOCKET_IFNAME={requested} has no routable IPv4 address"
+        )
+
     for iface in ni.interfaces():
         addrs = ni.ifaddresses(iface)
         if ni.AF_INET not in addrs:
@@ -245,6 +259,12 @@ class MscclppVanillaBackend(Backend):
                 return MscclppAllReduce6(group, memory.size, memory.dtype)
             except Exception:
                 pass
+        if (
+            group.nranks == 4
+            and (nranks_per_node is None or nranks_per_node == 4)
+            and os.environ.get("MTCCL_DISABLE_PAIR_HIER", "0") != "1"
+        ):
+            return MscclppAllReduce7(group, memory)
         return MscclppAllReduce1(group, memory)
 
     def __call__(self, stream):
@@ -348,6 +368,9 @@ def run_one(backend_name, mode_or_none, scenario, sizes, niter,
             memory = GpuBuffer(nelems, dtype=dtype)
             memory_out = GpuBuffer(nelems, dtype=dtype)
             cp.cuda.runtime.deviceSynchronize()
+
+            if rank == 0:
+                print(f"  [start {backend_name:14s}] {human_size(memory.nbytes):>8s}", flush=True)
 
             if backend_name == "nccl":
                 bk = NcclBackend()
