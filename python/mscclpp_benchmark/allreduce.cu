@@ -296,7 +296,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1)
 }
 
 // -------------------------------------------
-// AllReduce7
+// NOTE: AllReduce7
 // Single-node 4-GPU paired topology:
 //   rank 0 <-> rank 1 via fast local link
 //   rank 2 <-> rank 3 via fast local link
@@ -307,6 +307,7 @@ __forceinline__ __device__ int channelIndexForRank(int rank, int remoteRank) {
   return remoteRank < rank ? remoteRank : remoteRank - 1;
 }
 
+//NOTE: buff[i] = buff[i] + memChan.read<TYPE>(i) 将memChan中的数据和buff中的数据进行reduce操作，结果存储在buff中，memChan和buff的大小都是nelems个TYPE
 __forceinline__ __device__ void reduceFullBufferFromMemChan(mscclpp::MemoryChannelDeviceHandle& memChan, TYPE* buff,
                                                             size_t nelems, int tid, int nThreads) {
   const size_t totalBytes = nelems * sizeof(TYPE);
@@ -325,6 +326,8 @@ __forceinline__ __device__ void reduceFullBufferFromMemChan(mscclpp::MemoryChann
   }
 }
 
+
+//NOTE: dst[i]=src[i] 将src的数据拷贝到dst中，src和dst的大小都是nelems个TYPE
 __forceinline__ __device__ void copyFullBufferLocal(TYPE* dst, const TYPE* src, size_t nelems, int tid, int nThreads) {
   const size_t totalBytes = nelems * sizeof(TYPE);
   const size_t nInt4 = totalBytes / sizeof(int4);
@@ -341,6 +344,7 @@ __forceinline__ __device__ void copyFullBufferLocal(TYPE* dst, const TYPE* src, 
   }
 }
 
+//NOTE: dst[i]=dst[i]+src[i] 将src的数据和dst的数据进行reduce操作，结果存储在dst中，src和dst的大小都是nelems个TYPE
 __forceinline__ __device__ void reduceFullBufferLocal(TYPE* dst, const TYPE* src, size_t nelems, int tid,
                                                       int nThreads) {
   const size_t totalBytes = nelems * sizeof(TYPE);
