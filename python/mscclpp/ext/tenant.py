@@ -635,7 +635,8 @@ def _cpp_mode(mode: PolicyMode):
 
 def TenantAwareProxyService(mode: PolicyMode = PolicyMode.SINGLE_PASSTHROUGH,
                             fifo_size: int = 128,
-                            scheduling_window_size: int = 5):
+                            scheduling_window_size: int = 5,
+                            debug: bool = False):
     """Construct a C++ TenantAwareProxyService — drop-in replacement for
     mscclpp.ProxyService with per-tenant scheduling.
 
@@ -644,7 +645,19 @@ def TenantAwareProxyService(mode: PolicyMode = PolicyMode.SINGLE_PASSTHROUGH,
     """
     from mscclpp._mscclpp import CppTenantAwareProxyService
     window = max(1, int(scheduling_window_size))
-    svc = CppTenantAwareProxyService(_cpp_mode(mode), fifo_size, window)
+    try:
+        svc = CppTenantAwareProxyService(_cpp_mode(mode), fifo_size, window, bool(debug))
+    except TypeError:
+        svc = CppTenantAwareProxyService(_cpp_mode(mode), fifo_size, window)
+        if debug:
+            if hasattr(svc, "set_debug"):
+                svc.set_debug(True)
+            else:
+                raise RuntimeError(
+                    "TenantAwareProxyService(debug=True) requires rebuilding the "
+                    "mscclpp Python extension so CppTenantAwareProxyService exposes "
+                    "the debug flag."
+                )
     return svc
 
 

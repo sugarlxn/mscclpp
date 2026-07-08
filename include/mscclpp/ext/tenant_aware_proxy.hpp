@@ -35,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
@@ -171,10 +172,11 @@ class TokenBucket {
 class TenantAwareProxyHandler {
  public:
   TenantAwareProxyHandler(ContextProxyHandler inner, PolicyMode mode = PolicyMode::SinglePassthrough,
-                          uint32_t schedulingWindowSize = DEFAULT_SCHEDULING_WINDOW_SIZE)
+                          uint32_t schedulingWindowSize = DEFAULT_SCHEDULING_WINDOW_SIZE, bool debug = false)
       : inner_(std::move(inner)),
         mode_(mode),
-        schedulingWindowSize_(schedulingWindowSize == 0 ? 1 : schedulingWindowSize) {}
+        schedulingWindowSize_(schedulingWindowSize == 0 ? 1 : schedulingWindowSize),
+        debug_(debug || envDebugEnabled()) {}
 
   /// Re-point the inner handler (used by TenantAwareProxyService, where the
   /// handler is created before the inner is known).
@@ -198,6 +200,9 @@ class TenantAwareProxyHandler {
 
   void setMode(PolicyMode mode) { mode_ = mode; }
   PolicyMode mode() const { return mode_; }
+
+  void setDebug(bool enabled) { debug_.store(enabled, std::memory_order_release); }
+  bool debugEnabled() const { return debug_.load(std::memory_order_acquire); }
 
   /// Returns a callable usable as a ContextProxyHandler (std::function compatible).
   ContextProxyHandler asHandler() {
@@ -263,6 +268,7 @@ class TenantAwareProxyHandler {
       //NOTE：并且 当tenant队列为空时， 进入bypass 路径
       if (queuesEmpty) {
         // Bypass: pass the ORIGINAL ctx (poll-time fifoPos) straight through.
+        logDispatch("bypass", tid, trig, ctx, UINT64_MAX, static_cast<uint32_t>(trig.fields.semaphoreId));
         return inner_(trig, ctx);
       }
     }
@@ -321,6 +327,48 @@ class TenantAwareProxyHandler {
     uint32_t         connKey;   // semaphoreId — same PortChannel shares one proxy sem
     ProxyFifoContext ctx;       // PUSH-time fifoPos + enqueueNs (design.md §5.7)
   };
+
+  static bool envDebugEnabled() {
+    const char* v = std::getenv("MTCCL_PROXY_DEBUG");
+    if (v == nullptr) v = std::getenv("MTCCL_TENANT_PROXY_DEBUG");
+    if (v == nullptr) return false;
+    return v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T';
+  }
+
+  static const char* triggerTypeName(uint64_t type) {
+    switch (type) {
+      case TriggerData:
+        return "data";
+      case TriggerFlag:
+        return "flag";
+      case TriggerSync:
+        return "sync";
+      default:
+        return "unknown";
+    }
+  }
+
+  void logDispatch(const char* path, uint32_t tenantId, const ProxyTrigger& trig, const ProxyFifoContext& ctx,
+                   uint64_t schedulerSeq, uint32_t connKey) {
+    if (!debug_.load(std::memory_order_acquire)) return;
+    uint64_t order = debugDispatchOrder_.fetch_add(1, std::memory_order_relaxed) + 1;
+    fprintf(stderr,
+            "[mt-mscclpp][proxy-debug] order=%llu path=%s tenant=%u trigger_tid=%llu type=%s(%llu) "
+            "sem=%llu conn=%u size=%llu src_mem=%llu dst_mem=%llu src_off=%llu dst_off=%llu "
+            "fifo_pos=%llu enqueue_ns=%llu sched_seq=%llu mode=%d\n",
+            static_cast<unsigned long long>(order), path, tenantId,
+            static_cast<unsigned long long>(trig.fields.tenantId), triggerTypeName(trig.fields.type),
+            static_cast<unsigned long long>(trig.fields.type),
+            static_cast<unsigned long long>(trig.fields.semaphoreId), connKey,
+            static_cast<unsigned long long>(trig.fields.size),
+            static_cast<unsigned long long>(trig.fields.srcMemoryId),
+            static_cast<unsigned long long>(trig.fields.dstMemoryId),
+            static_cast<unsigned long long>(trig.fields.srcOffset),
+            static_cast<unsigned long long>(trig.fields.dstOffset),
+            static_cast<unsigned long long>(ctx.fifoPos),
+            static_cast<unsigned long long>(ctx.enqueueNs),
+            static_cast<unsigned long long>(schedulerSeq), static_cast<int>(mode_));
+  }
 
   ProxyHandlerResult drain() {
     // The proxy thread is single-threaded; operator() is called once per
@@ -382,6 +430,7 @@ class TenantAwareProxyHandler {
     // This is the v0.2.1 invariant: TriggerSync flush boundaries follow the
     // push-time fifoPos, not the dispatch-time tail (which has advanced by
     // however many triggers were polled while this one waited in queue).
+    logDispatch("scheduled", pickedTid, picked.trigger, picked.ctx, picked.seq, picked.connKey);
     return inner_(picked.trigger, picked.ctx);
   }
 
@@ -628,6 +677,8 @@ class TenantAwareProxyHandler {
   // DRR deficit (signed; can be temporarily negative after the escape hatch).
   std::array<int64_t, MAX_TENANTS> deficit_{};
   std::array<SchedulerDebugCounters, MAX_TENANTS> debugCounters_{};
+  std::atomic<bool> debug_{false};
+  std::atomic<uint64_t> debugDispatchOrder_{0};
   uint64_t nextSeq_ = 0;
   size_t pendingCount_ = 0;
   uint32_t rrCursor_ = 0;
@@ -659,9 +710,9 @@ class TenantAwareProxyHandler {
 class TenantAwareProxyService : public ProxyService {
  public:
   TenantAwareProxyService(PolicyMode mode = PolicyMode::SinglePassthrough, int fifoSize = DEFAULT_FIFO_SIZE,
-                          uint32_t schedulingWindowSize = DEFAULT_SCHEDULING_WINDOW_SIZE)
+                          uint32_t schedulingWindowSize = DEFAULT_SCHEDULING_WINDOW_SIZE, bool debug = false)
       : ProxyService(fifoSize),
-        handler_(std::make_shared<TenantAwareProxyHandler>(ContextProxyHandler{}, mode, schedulingWindowSize)) {
+        handler_(std::make_shared<TenantAwareProxyHandler>(ContextProxyHandler{}, mode, schedulingWindowSize, debug)) {
     // The decorator captures handler_ (constructed BEFORE this lambda runs)
     // and installs it as the proxy's outer context-aware handler.
     // Using setContextHandlerDecorator (not setHandlerDecorator) is what
@@ -695,6 +746,9 @@ class TenantAwareProxyService : public ProxyService {
 
   void setMode(PolicyMode mode) { handler_->setMode(mode); }
   PolicyMode mode() const { return handler_->mode(); }
+
+  void setDebug(bool enabled) { handler_->setDebug(enabled); }
+  bool debugEnabled() const { return handler_->debugEnabled(); }
 
   /// MT-MSCCL++: total count of triggers that arrived with an unregistered
   /// tenantId during this service's lifetime. Each was rewritten to
