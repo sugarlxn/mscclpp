@@ -77,6 +77,8 @@ CSV_FIELDS = [
     "size_human",
     "niter",
     "time_us",
+    "job_time_us",
+    "job_time_ms",
     "alg_bw_gbps",
     "wallclock_gbps",
     "wall_s",
@@ -90,6 +92,10 @@ CSV_FIELDS = [
     "token_bucket_waits",
     "drr_picks",
     "strict_priority_picks",
+    "scheduler_wait_samples",
+    "scheduler_wait_avg_ns",
+    "scheduler_wait_p50_ns",
+    "scheduler_wait_p99_ns",
 ]
 
 
@@ -324,10 +330,33 @@ def make_cpp_mt_algo(group, memory, memory_out, proxy_service, nranks_per_node: 
 
 def make_scenario_specs(rate_cap_gbps: float) -> dict[str, ScenarioSpec]:
     cap_bps = int(rate_cap_gbps * 1e9)
+    inference = "inference"
+    training_a = "trainingA"
+    training_b = "trainingB"
     tenant_a = "tenantA"
     tenant_b = "tenantB"
     tenant_c = "tenantC"
     return {
+        "infer_priority": ScenarioSpec(
+            name="mtccl_infer_priority_3tenant",
+            policy="strict_priority",
+            mode=PolicyMode.STRICT_PRIORITY,
+            tenants=(
+                TenantSpec(1, training_a, QoSClass.BEST_EFFORT, 1),
+                TenantSpec(2, training_b, QoSClass.BEST_EFFORT, 1),
+                TenantSpec(3, inference, QoSClass.REALTIME, 1),
+            ),
+        ),
+        "equal_priority": ScenarioSpec(
+            name="mtccl_equal_priority_3tenant",
+            policy="strict_priority_equal_qos",
+            mode=PolicyMode.STRICT_PRIORITY,
+            tenants=(
+                TenantSpec(1, training_a, QoSClass.STANDARD, 1),
+                TenantSpec(2, training_b, QoSClass.STANDARD, 1),
+                TenantSpec(3, inference, QoSClass.STANDARD, 1),
+            ),
+        ),
         "fair": ScenarioSpec(
             name="mtccl_fair_3tenant",
             policy="fair",
@@ -373,6 +402,10 @@ def make_scenario_specs(rate_cap_gbps: float) -> dict[str, ScenarioSpec]:
 
 def normalize_scenarios(raw: str, specs: dict[str, ScenarioSpec]) -> list[ScenarioSpec]:
     aliases = {
+        "mtccl_infer_priority_3tenant": "infer_priority",
+        "mtccl_equal_priority_3tenant": "equal_priority",
+        "inference_priority": "infer_priority",
+        "same_priority": "equal_priority",
         "mtccl_fair_3tenant": "fair",
         "mtccl_priority_3tenant": "priority",
         "mtccl_weighted_3tenant": "weighted",
@@ -386,14 +419,22 @@ def normalize_scenarios(raw: str, specs: dict[str, ScenarioSpec]) -> list[Scenar
     if not requested:
         raise ValueError("--scenarios cannot be empty")
     if "all" in requested:
-        requested = ["fair", "priority", "weighted", "rate_limited"]
+        requested = ["infer_priority", "equal_priority", "fair", "priority", "weighted", "rate_limited"]
 
     out = []
     seen = set()
     for name in requested:
         key = aliases.get(name, name)
         if key not in specs:
-            valid = ",".join(["fair", "priority", "weighted", "rate_limited", "all"])
+            valid = ",".join([
+                "infer_priority",
+                "equal_priority",
+                "fair",
+                "priority",
+                "weighted",
+                "rate_limited",
+                "all",
+            ])
             raise ValueError(f"unknown scenario {name!r}; valid values: {valid}")
         if key not in seen:
             out.append(specs[key])
@@ -419,6 +460,34 @@ def parse_ops(raw: str | None, tenants: tuple[TenantSpec, ...], default_ops: int
     return {tenant.tenant_id: value for tenant, value in zip(tenants, values)}
 
 
+def make_size_profiles(
+    sizes: list[int],
+    tenant_sizes: list[int] | None,
+    tenants: tuple[TenantSpec, ...],
+) -> list[dict[int, int]]:
+    if tenant_sizes is not None:
+        if len(tenant_sizes) == 1:
+            tenant_sizes = tenant_sizes * len(tenants)
+        elif len(tenant_sizes) != len(tenants):
+            raise ValueError(
+                f"--tenant-sizes-bytes expects one value or {len(tenants)} "
+                f"comma-separated values for {[tenant.name for tenant in tenants]}"
+            )
+        return [{tenant.tenant_id: size for tenant, size in zip(tenants, tenant_sizes)}]
+
+    return [
+        {tenant.tenant_id: size for tenant in tenants}
+        for size in sizes
+    ]
+
+
+def describe_size_profile(profile: dict[int, int], tenants: tuple[TenantSpec, ...]) -> str:
+    return ", ".join(
+        f"{tenant.name}={human_size(profile[tenant.tenant_id])}"
+        for tenant in tenants
+    )
+
+
 def kstream_enabled(single_stream: bool) -> bool:
     if single_stream:
         os.environ["MTCCL_K_STREAMS"] = "0"
@@ -438,7 +507,7 @@ def backend_label(mode: PolicyMode, use_k_streams: bool) -> str:
 
 def run_cpp_scenario(
     scenario: ScenarioSpec,
-    size_bytes_list: list[int],
+    size_profiles: list[dict[int, int]],
     niter: int,
     ops_arg: str | None,
     dtype,
@@ -451,13 +520,17 @@ def run_cpp_scenario(
     use_k_streams: bool,
     sched_window_size: int,
     proxy_debug: bool,
+    inference_delay_ms: float,
 ) -> list[dict]:
     rows = []
     ops_by_tenant = parse_ops(ops_arg, scenario.tenants, niter)
     max_ops = max(ops_by_tenant.values())
+    inference_delay_s = max(0.0, inference_delay_ms) / 1000.0
+    launch_tenants = tuple(
+        tenant for tenant in scenario.tenants if tenant.name != "inference"
+    ) + tuple(tenant for tenant in scenario.tenants if tenant.name == "inference")
 
-    for size_bytes in size_bytes_list:
-        nelems = bytes_to_nelems(size_bytes, dtype)
+    for size_profile in size_profiles:
         proxy_service = TenantAwareProxyService(
             mode=scenario.mode,
             scheduling_window_size=sched_window_size,
@@ -477,6 +550,8 @@ def run_cpp_scenario(
         try:
             algos = {}
             for tenant in scenario.tenants:
+                size_bytes = size_profile[tenant.tenant_id]
+                nelems = bytes_to_nelems(size_bytes, dtype)
                 memory = GpuBuffer(nelems, dtype=dtype)
                 memory_out = GpuBuffer(nelems, dtype=dtype)
                 cp.cuda.runtime.deviceSynchronize()
@@ -547,8 +622,10 @@ def run_cpp_scenario(
 
             if use_cuda_graph:
                 if use_k_streams:
-                    for tenant in scenario.tenants:
+                    for tenant in launch_tenants:
                         tid = tenant.tenant_id
+                        if tenant.name == "inference" and inference_delay_s > 0:
+                            time.sleep(inference_delay_s)
                         graphs[tid].launch(streams[tid])
                         end_events[tid].record(streams[tid])
                 else:
@@ -557,8 +634,10 @@ def run_cpp_scenario(
                         end_events[tenant.tenant_id].record(primary)
             else:
                 if use_k_streams:
-                    for tenant in scenario.tenants:
+                    for tenant in launch_tenants:
                         tid = tenant.tenant_id
+                        if tenant.name == "inference" and inference_delay_s > 0:
+                            time.sleep(inference_delay_s)
                         stream = streams[tid]
                         for _ in range(ops_by_tenant[tid]):
                             algos[tid][0](stream)
@@ -585,13 +664,14 @@ def run_cpp_scenario(
                     else {}
                 )
                 backend = backend_label(scenario.mode, use_k_streams)
-                actual_size_bytes = algos[scenario.tenants[0].tenant_id][1].nbytes
                 for tenant in scenario.tenants:
                     tid = tenant.tenant_id
                     sched = counters.get(tid, {})
                     span_ms = cp.cuda.get_elapsed_time(start_event, end_events[tid])
                     ops = ops_by_tenant[tid]
-                    time_us = span_ms * 1000.0 / ops
+                    job_time_us = span_ms * 1000.0
+                    time_us = job_time_us / ops
+                    actual_size_bytes = algos[tid][1].nbytes
                     bytes_sent = actual_size_bytes * ops
                     row = {
                         "run_id": run_id,
@@ -608,6 +688,8 @@ def run_cpp_scenario(
                         "size_human": human_size(actual_size_bytes),
                         "niter": ops,
                         "time_us": round(time_us, 3),
+                        "job_time_us": round(job_time_us, 3),
+                        "job_time_ms": round(span_ms, 3),
                         "alg_bw_gbps": round(alg_bw_gbps(actual_size_bytes, time_us), 3),
                         "wallclock_gbps": round(bytes_sent / wall_s / 1e9, 3),
                         "wall_s": round(wall_s, 6),
@@ -627,6 +709,18 @@ def run_cpp_scenario(
                         "strict_priority_picks": int(
                             sched.get("strict_priority_picks", 0)
                         ),
+                        "scheduler_wait_samples": int(
+                            sched.get("scheduler_wait_samples", 0)
+                        ),
+                        "scheduler_wait_avg_ns": int(
+                            sched.get("scheduler_wait_avg_ns", 0)
+                        ),
+                        "scheduler_wait_p50_ns": int(
+                            sched.get("scheduler_wait_p50_ns", 0)
+                        ),
+                        "scheduler_wait_p99_ns": int(
+                            sched.get("scheduler_wait_p99_ns", 0)
+                        ),
                     }
                     rows.append(row)
                     cap = (
@@ -637,12 +731,16 @@ def run_cpp_scenario(
                     print(
                         f"  [{scenario.name} {tenant.name} {tenant.qos.name}"
                         f" w={tenant.weight} ops={ops}{cap}] "
-                        f"{row['size_human']:>8s} {time_us:9.2f} us "
+                        f"{row['size_human']:>8s} {time_us:9.2f} us/op "
+                        f"job={job_time_us / 1000.0:9.3f} ms "
                         f"{row['alg_bw_gbps']:7.3f} GB/s "
                         f"wall={row['wallclock_gbps']:7.3f} GB/s "
                         f"disp={row['sched_dispatched_triggers']} "
                         f"drr={row['drr_picks']} sp={row['strict_priority_picks']} "
-                        f"wait={row['token_bucket_waits']}",
+                        f"wait={row['token_bucket_waits']} "
+                        f"qavg={row['scheduler_wait_avg_ns'] / 1000.0:.1f}us "
+                        f"q50={row['scheduler_wait_p50_ns'] / 1000.0:.1f}us "
+                        f"q99={row['scheduler_wait_p99_ns'] / 1000.0:.1f}us",
                         flush=True,
                     )
             comm.barrier()
@@ -659,7 +757,23 @@ def write_csv(path: str, rows: list[dict]) -> None:
     out = Path(path)
     if out.parent:
         out.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not out.exists()
+    existing_rows = []
+    rewrite_existing = False
+    if out.exists():
+        with out.open(newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames and reader.fieldnames != CSV_FIELDS:
+                rewrite_existing = True
+                existing_rows = list(reader)
+
+    if rewrite_existing:
+        with out.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            for row in existing_rows:
+                writer.writerow({field: row.get(field, "") for field in CSV_FIELDS})
+
+    write_header = not out.exists() or out.stat().st_size == 0
     with out.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         if write_header:
@@ -683,6 +797,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional comma-separated element counts. Ignored when --sizes-bytes is set.",
     )
+    parser.add_argument(
+        "--tenant-sizes-bytes",
+        default=None,
+        help=(
+            "Optional per-tenant message sizes in scenario tenant order. "
+            "For infer/equal scenarios the order is trainingA,trainingB,inference; "
+            "example: 12MiB,12MiB,256KiB."
+        ),
+    )
     parser.add_argument("--niter", type=int, default=50)
     parser.add_argument(
         "--ops",
@@ -694,8 +817,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--scenarios",
-        default="fair,priority",
-        help="Comma list: fair,priority,weighted,rate_limited,all.",
+        default="infer_priority,equal_priority",
+        help=(
+            "Comma list: infer_priority,equal_priority,fair,priority,"
+            "weighted,rate_limited,all."
+        ),
     )
     parser.add_argument(
         "--rate-cap-gbps",
@@ -708,6 +834,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="TenantAwareProxyService scheduling window size.",
+    )
+    parser.add_argument(
+        "--inference-delay-ms",
+        type=float,
+        default=0.0,
+        help=(
+            "Delay inference tenant launch by this many milliseconds after "
+            "training tenants launch in k-stream mode."
+        ),
     )
     parser.add_argument(
         "--no-cuda-graph",
@@ -746,6 +881,11 @@ def main() -> int:
         size_bytes_list = [int(nelems) * itemsize for nelems in args.sizes.split(",")]
     else:
         size_bytes_list = parse_size_list_bytes("12MiB")
+    tenant_size_bytes = (
+        parse_size_list_bytes(args.tenant_sizes_bytes)
+        if args.tenant_sizes_bytes is not None
+        else None
+    )
 
     scenario_specs = make_scenario_specs(args.rate_cap_gbps)
     scenarios = normalize_scenarios(args.scenarios, scenario_specs)
@@ -779,12 +919,17 @@ def main() -> int:
             f"world={comm.size} nranks_per_node={nranks_per_node} "
             f"dtype={args.dtype} niter={args.niter} "
             f"ops={args.ops or args.niter} "
-            f"k_streams={int(use_k_streams)} cuda_graph={int(use_cuda_graph)} ===\n",
+            f"k_streams={int(use_k_streams)} cuda_graph={int(use_cuda_graph)} "
+            f"inference_delay_ms={args.inference_delay_ms:g} ===\n",
             flush=True,
         )
         print(f"Selected interface: {iface} ({my_ip}), root_ip={root_ip}", flush=True)
         print(
-            "Sizes: " + ", ".join(human_size(size) for size in size_bytes_list),
+            "Sizes: " + (
+                ", ".join(human_size(size) for size in size_bytes_list)
+                if tenant_size_bytes is None
+                else "per-tenant " + ", ".join(human_size(size) for size in tenant_size_bytes)
+            ),
             flush=True,
         )
         print(
@@ -794,12 +939,22 @@ def main() -> int:
         print("", flush=True)
 
     for scenario in scenarios:
+        size_profiles = make_size_profiles(
+            size_bytes_list,
+            tenant_size_bytes,
+            scenario.tenants,
+        )
         if rank == 0:
             print(f"--- scenario: {scenario.name} ({scenario.policy}) ---", flush=True)
+            for profile in size_profiles:
+                print(
+                    "    sizes: " + describe_size_profile(profile, scenario.tenants),
+                    flush=True,
+                )
         rows.extend(
             run_cpp_scenario(
                 scenario=scenario,
-                size_bytes_list=size_bytes_list,
+                size_profiles=size_profiles,
                 niter=args.niter,
                 ops_arg=args.ops,
                 dtype=dtype,
@@ -812,6 +967,7 @@ def main() -> int:
                 use_k_streams=use_k_streams,
                 sched_window_size=args.sched_window_size,
                 proxy_debug=args.proxy_debug,
+                inference_delay_ms=args.inference_delay_ms,
             )
         )
 

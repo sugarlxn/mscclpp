@@ -10,7 +10,7 @@
 // Design alignment with doc/design.md:
 //   §3.5 — TenantContext / PolicyTable / BandwidthBudget data model
 //   §5.3 — Weighted Fair Queuing (Deficit Round Robin) over a per-tenant queue
-//   §5.4 — Strict Priority + Aging (chunk-boundary preemption)
+//   §5.4 — Strict Priority (chunk-boundary preemption)
 //   §5.5 — Single-tenant bypass (zero overhead when popcount(active_mask)==1)
 //   §6.3 — Token-bucket rate limiter
 //
@@ -27,12 +27,13 @@
 //     (keyed by semaphoreId — same PortChannel = same proxy sem).
 //   - TriggerSync cannot pass older same-connection Data/Flag triggers, so
 //     flush boundaries stay correct under delayed dispatch.
-//NOTE: 新增核心 scheduler：per-tenant queue、single-tenant bypass、fail-open、DRR、StrictPriority+Aging、Hybrid、token bucket、progress tick、per-connection ordering。
+//NOTE: 新增核心 scheduler：per-tenant queue、single-tenant bypass、fail-open、DRR、StrictPriority、Hybrid、token bucket、progress tick、per-connection ordering。
 
 #ifndef MSCCLPP_EXT_TENANT_AWARE_PROXY_HPP_
 #define MSCCLPP_EXT_TENANT_AWARE_PROXY_HPP_
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -42,6 +43,7 @@
 #include <functional>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include <mscclpp/ext/tenant.hpp>
 #include <mscclpp/fifo_device.hpp>
@@ -58,6 +60,9 @@ struct SchedulerDebugCounters {
   uint64_t token_bucket_waits = 0;
   uint64_t drr_picks = 0;
   uint64_t strict_priority_picks = 0;
+  uint64_t scheduler_wait_samples = 0;
+  uint64_t scheduler_wait_total_ns = 0;
+  std::vector<uint64_t> scheduler_wait_ns_samples;
 };
 
 constexpr uint32_t DEFAULT_SCHEDULING_WINDOW_SIZE = 5;
@@ -255,23 +260,9 @@ class TenantAwareProxyHandler {
     uint32_t oldMask = activeMask_.fetch_or(uint32_t{1} << tid, std::memory_order_acq_rel);
     uint32_t mask = oldMask | (uint32_t{1} << tid);
 
-    // (4) Single-tenant bypass(Fast path): zero scheduling overhead, BUT only when the
-    //     scheduler has no in-flight work. If we bypassed while queues still
-    //     held older triggers we would reorder relative to FIFO push order.
-    //NOTE: 当mask只有一个bit = 1, 则此时只有一个tenant活跃
-    if (__builtin_popcount(mask) <= 1) {
-      bool queuesEmpty;
-      {
-        std::lock_guard<std::mutex> g(mu_);
-        queuesEmpty = allQueuesEmptyLocked();
-      }
-      //NOTE：并且 当tenant队列为空时， 进入bypass 路径
-      if (queuesEmpty) {
-        // Bypass: pass the ORIGINAL ctx (poll-time fifoPos) straight through.
-        logDispatch("bypass", tid, trig, ctx, UINT64_MAX, static_cast<uint32_t>(trig.fields.semaphoreId));
-        return inner_(trig, ctx);
-      }
-    }
+    (void)mask;
+    // Experiment mode: single-tenant bypass is temporarily disabled so every
+    // trigger enters the scheduler and contributes queue-wait measurements.
 
     // (5) Slow path: enqueue with monotonic sequence + connection key. Once
     //     the scheduling window is full, drain exactly one trigger according
@@ -304,7 +295,7 @@ class TenantAwareProxyHandler {
   }
 
   /// Test-only: enqueue a trigger WITHOUT draining. Lets a unit test
-  /// stockpile triggers so the DRR / aging / per-conn ordering paths can be
+  /// stockpile triggers so the DRR / priority / per-conn ordering paths can be
   /// exercised against a non-trivial queue state — in production the proxy
   /// thread always calls operator() which drains immediately after enqueue,
   /// so synchronous unit tests can't naturally see deep queues.
@@ -346,6 +337,12 @@ class TenantAwareProxyHandler {
       default:
         return "unknown";
     }
+  }
+
+  static uint64_t steadyNowNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
   }
 
   void logDispatch(const char* path, uint32_t tenantId, const ProxyTrigger& trig, const ProxyFifoContext& ctx,
@@ -401,8 +398,12 @@ class TenantAwareProxyHandler {
       picked = q.front();
       size = static_cast<uint64_t>(picked.trigger.fst & ((uint64_t{1} << TriggerBitsSize) - 1));
 
-      // Rate limit check (bucket has its own internal mutex; cheap).
-      if (!buckets_[pickedTid].tryConsume(size == 0 ? 1 : size)) {
+      // Experiment mode for strict-priority isolation: keep StrictPriority as
+      // a pure QoS-class picker. Token bucket is a separate rate-limiting
+      // mechanism, so skip it here to avoid conflating priority effects with
+      // admission delay. Fair/Hybrid still use token buckets.
+      bool rateLimitEnabled = mode_ != PolicyMode::StrictPriority;
+      if (rateLimitEnabled && !buckets_[pickedTid].tryConsume(size == 0 ? 1 : size)) {
         debugCounters_[pickedTid].token_bucket_waits++;
         // Bucket dry. Refund the size that pickDrrLocked speculatively
         // decremented from this tenant's deficit; leave any credit issued
@@ -423,8 +424,13 @@ class TenantAwareProxyHandler {
       if (!cq.empty() && cq.front() == picked.seq) {
         cq.pop_front();
       }
+      uint64_t dispatchNs = steadyNowNs();
+      uint64_t waitNs = dispatchNs > picked.ctx.enqueueNs ? dispatchNs - picked.ctx.enqueueNs : 0;
       debugCounters_[pickedTid].sched_dispatched_triggers++;
       debugCounters_[pickedTid].sched_dispatched_bytes += size;
+      debugCounters_[pickedTid].scheduler_wait_samples++;
+      debugCounters_[pickedTid].scheduler_wait_total_ns += waitNs;
+      debugCounters_[pickedTid].scheduler_wait_ns_samples.push_back(waitNs);
     }
     // Outside the queue lock: dispatch with the ORIGINAL push-time context.
     // This is the v0.2.1 invariant: TriggerSync flush boundaries follow the
@@ -462,19 +468,6 @@ class TenantAwareProxyHandler {
   // large enough that pure-small-message workloads don't churn.
   static constexpr uint64_t kDrrQuantumBytes = 64 * 1024;  // 64 KiB
 
-  // Aging threshold for StrictPriority — design.md §5.4.1 specifies 100 ms.
-  // After this many ns, a queued trigger's effective priority is boosted by
-  // one level per threshold elapsed, capped at the top QoS class. Aging is
-  // ONLY about preventing starvation; it never demotes anything.
-  static constexpr uint64_t kAgingThresholdNs = 100ULL * 1000ULL * 1000ULL;  // 100 ms
-
-  static uint64_t monoNowNs() {
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count());
-  }
-
   // Caller must hold mu_. Apply the configured PolicyMode but only consider
   // tenants whose queue head is currently eligible per-connection.
   //
@@ -493,7 +486,7 @@ class TenantAwareProxyHandler {
         return pickStrictPriorityLocked();
 
       case PolicyMode::Hybrid: {
-        // Premium / Realtime first (with aging), otherwise fall through to DRR.
+        // Premium / Realtime first, otherwise fall through to DRR.
         uint32_t premium = pickStrictPriorityLocked(/*minClass=*/QoSClass::Premium);
         if (premium < MAX_TENANTS) return premium;
         return pickDrrLocked();
@@ -505,38 +498,23 @@ class TenantAwareProxyHandler {
     return MAX_TENANTS;
   }
 
-  // StrictPriority with aging.
+  // Pure StrictPriority.
   // - minClass (default BestEffort) lets Hybrid restrict the search to
   //   Premium/Realtime tenants.
-  // - Aging promotes a tenant's effective QoS class by 1 per kAgingThresholdNs
-  //   the head trigger has been queued, capped at Realtime.
+  // - Aging/starvation-prevention is intentionally disabled in this experiment
+  //   mode so priority results are not diluted by automatic promotion.
   // - Eligible only when the head is at the front of its connection queue
   //   (design.md §5.7.1).
   uint32_t pickStrictPriorityLocked(QoSClass minClass = QoSClass::BestEffort) {
     uint32_t best = MAX_TENANTS;
-    int bestEffPri = -1;
-    uint64_t now = monoNowNs();
+    int bestPri = -1;
     for (uint32_t t = 0; t < MAX_TENANTS; ++t) {
       if (!tenantHeadEligibleLocked(t)) continue;
       int basePri = static_cast<int>(tenants_[t].qos_class);
       if (basePri < static_cast<int>(minClass)) continue;
 
-      // Aging boost based on the OLDEST queued trigger for this tenant
-      // (= queue head, since we enqueue in arrival order).
-      uint64_t enqueueNs = queues_[t].front().ctx.enqueueNs;
-      int agedBoost = 0;
-      if (enqueueNs != 0 && now > enqueueNs) {
-        uint64_t waitNs = now - enqueueNs;
-        if (waitNs >= kAgingThresholdNs) {
-          agedBoost = static_cast<int>(waitNs / kAgingThresholdNs);
-        }
-      }
-      // Cap effective priority at the top class.
-      constexpr int kMaxQosLevel = static_cast<int>(QoSClass::Realtime);
-      int effPri = std::min(basePri + agedBoost, kMaxQosLevel);
-
-      if (effPri > bestEffPri) {
-        bestEffPri = effPri;
+      if (basePri > bestPri) {
+        bestPri = basePri;
         best = t;
       }
     }
@@ -630,8 +608,7 @@ class TenantAwareProxyHandler {
   /// MT-MSCCL++ (design.md §5.3.3 v0.2.1): progress hook called from the
   /// proxy thread's progressHandler. Lets the scheduler retry dispatch
   /// even when no new trigger has arrived — important when a tenant's
-  /// token bucket was dry and has since refilled, or when aging must
-  /// trigger a re-pick under sustained Realtime traffic.
+  /// token bucket was dry and has since refilled.
   /// Safe to call concurrently with operator() since both are invoked on
   /// the single proxy thread.
   void tickProgress() {

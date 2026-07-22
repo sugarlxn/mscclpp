@@ -7,6 +7,8 @@
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 
+#include <algorithm>
+
 #include <mscclpp/ext/tenant.hpp>
 #include <mscclpp/ext/tenant_aware_proxy.hpp>
 
@@ -70,6 +72,22 @@ void register_tenant(nb::module_& m) {
                row["token_bucket_waits"] = c.token_bucket_waits;
                row["drr_picks"] = c.drr_picks;
                row["strict_priority_picks"] = c.strict_priority_picks;
+               row["scheduler_wait_samples"] = c.scheduler_wait_samples;
+               row["scheduler_wait_avg_ns"] =
+                   c.scheduler_wait_samples ? c.scheduler_wait_total_ns / c.scheduler_wait_samples : uint64_t{0};
+               auto samples = c.scheduler_wait_ns_samples;
+               if (!samples.empty()) {
+                 std::sort(samples.begin(), samples.end());
+                 auto pct = [&samples](double q) -> uint64_t {
+                   size_t idx = static_cast<size_t>(q * static_cast<double>(samples.size() - 1));
+                   return samples[idx];
+                 };
+                 row["scheduler_wait_p50_ns"] = pct(0.50);
+                 row["scheduler_wait_p99_ns"] = pct(0.99);
+               } else {
+                 row["scheduler_wait_p50_ns"] = uint64_t{0};
+                 row["scheduler_wait_p99_ns"] = uint64_t{0};
+               }
                out[nb::int_(tid)] = row;
              }
              return out;
