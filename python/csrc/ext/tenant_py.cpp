@@ -29,7 +29,8 @@ void register_tenant(nb::module_& m) {
       .value("SinglePassthrough", PolicyMode::SinglePassthrough)
       .value("Fair", PolicyMode::Fair)
       .value("StrictPriority", PolicyMode::StrictPriority)
-      .value("Hybrid", PolicyMode::Hybrid);
+      .value("Hybrid", PolicyMode::Hybrid)
+      .value("Fifo", PolicyMode::Fifo);
 
   nb::class_<TenantContext>(m, "CppTenantContext")
       .def(nb::init<>())
@@ -50,14 +51,22 @@ void register_tenant(nb::module_& m) {
   // TenantAwareProxyService derives from ProxyService, so the BaseProxyService
   // parent allows polymorphism with the existing CppBaseProxyService binding.
   nb::class_<TenantAwareProxyService, ProxyService>(m, "CppTenantAwareProxyService")
-      .def(nb::init<PolicyMode, int, uint32_t, bool>(), nb::arg("mode") = PolicyMode::SinglePassthrough,
+      .def(nb::init<PolicyMode, int, uint32_t, bool, uint64_t, uint64_t>(),
+           nb::arg("mode") = PolicyMode::SinglePassthrough,
            nb::arg("fifo_size") = DEFAULT_FIFO_SIZE,
-           nb::arg("scheduling_window_size") = DEFAULT_SCHEDULING_WINDOW_SIZE, nb::arg("debug") = false)
+           nb::arg("scheduling_window_size") = DEFAULT_SCHEDULING_WINDOW_SIZE, nb::arg("debug") = false,
+           nb::arg("small_collective_threshold_bytes") = DEFAULT_SMALL_COLLECTIVE_THRESHOLD_BYTES,
+           nb::arg("aging_ns") = DEFAULT_AGING_NS)
       .def("update_tenant", &TenantAwareProxyService::updateTenant, nb::arg("ctx"), nb::arg("budget"))
       .def("register_tenant", &TenantAwareProxyService::registerTenant, nb::arg("tenant_id"), nb::arg("qos"),
            nb::arg("weight") = 1, nb::arg("bandwidth_max_bps") = uint64_t{0}, nb::arg("burst_bytes") = uint64_t{0})
       .def("remove_tenant", &TenantAwareProxyService::removeTenant, nb::arg("tenant_id"))
       .def("set_mode", &TenantAwareProxyService::setMode, nb::arg("mode"))
+      .def("set_tenant_collective_bytes", &TenantAwareProxyService::setTenantCollectiveBytes,
+           nb::arg("tenant_id"), nb::arg("bytes"))
+      .def("set_small_collective_threshold_bytes", &TenantAwareProxyService::setSmallCollectiveThresholdBytes,
+           nb::arg("bytes"))
+      .def("small_collective_threshold_bytes", &TenantAwareProxyService::smallCollectiveThresholdBytes)
       .def("set_debug", &TenantAwareProxyService::setDebug, nb::arg("enabled"))
       .def("debug_enabled", &TenantAwareProxyService::debugEnabled)
       .def("scheduler_debug_counters",
@@ -67,6 +76,8 @@ void register_tenant(nb::module_& m) {
              for (uint32_t tid = 0; tid < MAX_TENANTS; ++tid) {
                const auto& c = counters[tid];
                nb::dict row;
+               row["size_aware_bypass_triggers"] = c.size_aware_bypass_triggers;
+               row["size_aware_bypass_bytes"] = c.size_aware_bypass_bytes;
                row["sched_dispatched_triggers"] = c.sched_dispatched_triggers;
                row["sched_dispatched_bytes"] = c.sched_dispatched_bytes;
                row["token_bucket_waits"] = c.token_bucket_waits;

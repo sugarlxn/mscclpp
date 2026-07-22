@@ -19,6 +19,7 @@
 #include <mscclpp/proxy.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <vector>
 
 #include "../framework.hpp"
@@ -33,6 +34,7 @@ using mscclpp::ProxyTrigger;
 using mscclpp::TriggerData;
 using mscclpp::TriggerSync;
 using mscclpp::ext::tenant::DEFAULT_TENANT;
+using mscclpp::ext::tenant::DEFAULT_SMALL_COLLECTIVE_THRESHOLD_BYTES;
 using mscclpp::ext::tenant::MAX_TENANTS;
 using mscclpp::ext::tenant::PolicyMode;
 using mscclpp::ext::tenant::QoSClass;
@@ -260,6 +262,81 @@ TEST(TenantSchedulerDebugCountersTest, StrictPriorityPickCounterIncreases) {
   EXPECT_GT(counters[1].strict_priority_picks, 0u);
   EXPECT_EQ(counters[1].drr_picks, 0u);
   EXPECT_EQ(counters[1].sched_dispatched_triggers, 1u);
+}
+
+TEST(TenantSchedulerSizeAwareTest, FourMiBBoundaryBypassesOnlySmallCollectives) {
+  Recorder rec;
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority, 2);
+  h.updateTenant({1, QoSClass::Realtime, 1, 0, 0, 0, 0}, {0, 0, 0});
+
+  h.setTenantCollectiveBytes(1, 4ULL * 1024ULL * 1024ULL);
+  h(makeTrigger(1, 1, TriggerData, 1024), makeCtx(1));
+  ASSERT_EQ(rec.records().size(), 1u);
+  auto counters = h.schedulerDebugCounters();
+  EXPECT_EQ(counters[1].size_aware_bypass_triggers, 1u);
+
+  h.setTenantCollectiveBytes(1, 4ULL * 1024ULL * 1024ULL + 1ULL);
+  h(makeTrigger(1, 2, TriggerData, 1024), makeCtx(2));
+  ASSERT_EQ(rec.records().size(), 2u);  // single-tenant fast path, not size bypass
+  counters = h.schedulerDebugCounters();
+  EXPECT_EQ(counters[1].size_aware_bypass_triggers, 1u);
+}
+
+TEST(TenantSchedulerSizeAwareTest, SmallInferenceBypassesWhileLargeTrainingIsQueued) {
+  Recorder rec;
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority, 5);
+  h.updateTenant({1, QoSClass::BestEffort, 1, 0, 0, 0, 0}, {0, 0, 0});
+  h.updateTenant({2, QoSClass::Realtime, 1, 0, 0, 0, 0}, {0, 0, 0});
+  h.setTenantCollectiveBytes(1, 64ULL * 1024ULL * 1024ULL);
+  h.setTenantCollectiveBytes(2, 256ULL * 1024ULL);
+
+  h.enqueueForTest(makeTrigger(1, 10, TriggerData), makeCtx(10));
+  h(makeTrigger(2, 20, TriggerData), makeCtx(20));
+  ASSERT_EQ(rec.records().size(), 1u);
+  EXPECT_EQ(rec.records()[0].tenantId, 2u);
+  EXPECT_EQ(h.pendingCountForTest(), 1u);
+
+  h.tickProgress();
+  ASSERT_EQ(rec.records().size(), 2u);
+  EXPECT_EQ(rec.records()[1].tenantId, 1u);
+}
+
+TEST(TenantSchedulerFifoTest, BaselinePreservesGlobalArrivalOrder) {
+  Recorder rec;
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::Fifo, 5);
+  h.enqueueForTest(makeTrigger(2, 20, TriggerData), makeCtx(20));
+  h.enqueueForTest(makeTrigger(1, 10, TriggerData), makeCtx(10));
+  h.enqueueForTest(makeTrigger(2, 21, TriggerData), makeCtx(21));
+
+  h.tickProgress();
+  h.tickProgress();
+  h.tickProgress();
+  ASSERT_EQ(rec.records().size(), 3u);
+  EXPECT_EQ(rec.records()[0].semaphoreId, 20u);
+  EXPECT_EQ(rec.records()[1].semaphoreId, 10u);
+  EXPECT_EQ(rec.records()[2].semaphoreId, 21u);
+}
+
+TEST(TenantSchedulerAgingTest, OldBestEffortEventuallyOutranksFreshRealtime) {
+  Recorder rec;
+  constexpr uint64_t agingNs = 1000;
+  TenantAwareProxyHandler h(rec.asHandler(), PolicyMode::StrictPriority, 5, false,
+                            DEFAULT_SMALL_COLLECTIVE_THRESHOLD_BYTES, agingNs);
+  h.updateTenant({1, QoSClass::BestEffort, 1, 0, 0, 0, 0}, {0, 0, 0});
+  h.updateTenant({2, QoSClass::Realtime, 1, 0, 0, 0, 0}, {0, 0, 0});
+
+  uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+  ProxyFifoContext oldCtx = makeCtx(1);
+  oldCtx.enqueueNs = now - 10 * agingNs;
+  ProxyFifoContext freshCtx = makeCtx(2);
+  freshCtx.enqueueNs = now;
+  h.enqueueForTest(makeTrigger(1, 10, TriggerData), oldCtx);
+  h.enqueueForTest(makeTrigger(2, 20, TriggerData), freshCtx);
+
+  h.tickProgress();
+  ASSERT_EQ(rec.records().size(), 1u);
+  EXPECT_EQ(rec.records()[0].tenantId, 1u);
 }
 
 TEST(TenantSchedulerDebugCountersTest, TokenBucketWaitCounterIncreasesWithoutDispatch) {

@@ -36,6 +36,7 @@ enum class PolicyMode : uint8_t {
   Fair              = 1,  //DRR / DRF 公平调度
   StrictPriority    = 2,  //绝对优先级，带老化机制的 chunk 边界抢占
   Hybrid            = 3,  //先 StrictPriority（仅 Premium/Realtime）优先，再 Fair
+  Fifo              = 4,  //size-aware FIFO baseline: preserve global arrival order
 };
 
 struct TenantContext {

@@ -55,6 +55,8 @@ namespace ext {
 namespace tenant {
 
 struct SchedulerDebugCounters {
+  uint64_t size_aware_bypass_triggers = 0;
+  uint64_t size_aware_bypass_bytes = 0;
   uint64_t sched_dispatched_triggers = 0;
   uint64_t sched_dispatched_bytes = 0;
   uint64_t token_bucket_waits = 0;
@@ -66,6 +68,8 @@ struct SchedulerDebugCounters {
 };
 
 constexpr uint32_t DEFAULT_SCHEDULING_WINDOW_SIZE = 5;
+constexpr uint64_t DEFAULT_SMALL_COLLECTIVE_THRESHOLD_BYTES = 4ULL * 1024ULL * 1024ULL;
+constexpr uint64_t DEFAULT_AGING_NS = 100ULL * 1000ULL * 1000ULL;
 
 /// Token-bucket rate limiter (design.md §6.3.1).
 class TokenBucket {
@@ -177,10 +181,14 @@ class TokenBucket {
 class TenantAwareProxyHandler {
  public:
   TenantAwareProxyHandler(ContextProxyHandler inner, PolicyMode mode = PolicyMode::SinglePassthrough,
-                          uint32_t schedulingWindowSize = DEFAULT_SCHEDULING_WINDOW_SIZE, bool debug = false)
+                          uint32_t schedulingWindowSize = DEFAULT_SCHEDULING_WINDOW_SIZE, bool debug = false,
+                          uint64_t smallCollectiveThresholdBytes = DEFAULT_SMALL_COLLECTIVE_THRESHOLD_BYTES,
+                          uint64_t agingNs = DEFAULT_AGING_NS)
       : inner_(std::move(inner)),
         mode_(mode),
         schedulingWindowSize_(schedulingWindowSize == 0 ? 1 : schedulingWindowSize),
+        smallCollectiveThresholdBytes_(smallCollectiveThresholdBytes),
+        agingNs_(agingNs == 0 ? 1 : agingNs),
         debug_(debug || envDebugEnabled()) {}
 
   /// Re-point the inner handler (used by TenantAwareProxyService, where the
@@ -205,6 +213,23 @@ class TenantAwareProxyHandler {
 
   void setMode(PolicyMode mode) { mode_ = mode; }
   PolicyMode mode() const { return mode_; }
+
+  /// Set the total collective size associated with a tenant's channels.
+  /// ProxyTrigger::size is only a transport-chunk size, so callers must
+  /// provide this hint for correct collective-level size classification.
+  void setTenantCollectiveBytes(TenantId id, uint64_t bytes) {
+    if (id < MAX_TENANTS) tenantCollectiveBytes_[id].store(bytes, std::memory_order_release);
+  }
+
+  /// Configure the inclusive upper bound for the direct small-message path.
+  void setSmallCollectiveThresholdBytes(uint64_t bytes) {
+    smallCollectiveThresholdBytes_.store(bytes, std::memory_order_release);
+  }
+
+  /// Return the inclusive upper bound for the direct small-message path.
+  uint64_t smallCollectiveThresholdBytes() const {
+    return smallCollectiveThresholdBytes_.load(std::memory_order_acquire);
+  }
 
   void setDebug(bool enabled) { debug_.store(enabled, std::memory_order_release); }
   bool debugEnabled() const { return debug_.load(std::memory_order_acquire); }
@@ -252,6 +277,23 @@ class TenantAwareProxyHandler {
                 tid);
       }
       tid = static_cast<uint32_t>(DEFAULT_TENANT);
+      trig.fields.tenantId = tid;
+    }
+
+    // TAPCS size classifier. A zero collective-size hint means "unknown" and
+    // deliberately takes the scheduled path; silently treating the trigger's
+    // chunk size as the collective size would misclassify large AllReduces.
+    uint64_t collectiveBytes = tenantCollectiveBytes_[tid].load(std::memory_order_acquire);
+    uint64_t threshold = smallCollectiveThresholdBytes_.load(std::memory_order_acquire);
+    if (collectiveBytes != 0 && threshold != 0 && collectiveBytes <= threshold) {
+      {
+        std::lock_guard<std::mutex> g(mu_);
+        debugCounters_[tid].size_aware_bypass_triggers++;
+        debugCounters_[tid].size_aware_bypass_bytes +=
+            static_cast<uint64_t>(trig.fst & ((uint64_t{1} << TriggerBitsSize) - 1));
+      }
+      logDispatch("size-bypass", tid, trig, ctx, 0, static_cast<uint32_t>(trig.fields.semaphoreId));
+      return inner_(trig, ctx);
     }
 
     // (3) Record this tenant as active BEFORE checking bypass. The fetch_or
@@ -260,9 +302,18 @@ class TenantAwareProxyHandler {
     uint32_t oldMask = activeMask_.fetch_or(uint32_t{1} << tid, std::memory_order_acq_rel);
     uint32_t mask = oldMask | (uint32_t{1} << tid);
 
-    (void)mask;
-    // Experiment mode: single-tenant bypass is temporarily disabled so every
-    // trigger enters the scheduler and contributes queue-wait measurements.
+    // Preserve the original zero-overhead single-tenant fast path. The queue
+    // must already be empty, otherwise direct dispatch could overtake work.
+    bool singleTenantBypass = false;
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      singleTenantBypass = __builtin_popcount(mask) <= 1 && allQueuesEmptyLocked();
+    }
+    if (singleTenantBypass) {
+      logDispatch("single-tenant-bypass", tid, trig, ctx, 0,
+                  static_cast<uint32_t>(trig.fields.semaphoreId));
+      return inner_(trig, ctx);
+    }
 
     // (5) Slow path: enqueue with monotonic sequence + connection key. Once
     //     the scheduling window is full, drain exactly one trigger according
@@ -482,6 +533,9 @@ class TenantAwareProxyHandler {
           if (tenantHeadEligibleLocked(t)) return t;
         return MAX_TENANTS;
 
+      case PolicyMode::Fifo:
+        return pickFifoLocked();
+
       case PolicyMode::StrictPriority:
         return pickStrictPriorityLocked();
 
@@ -498,23 +552,43 @@ class TenantAwareProxyHandler {
     return MAX_TENANTS;
   }
 
-  // Pure StrictPriority.
+  uint32_t pickFifoLocked() {
+    uint32_t best = MAX_TENANTS;
+    uint64_t bestSeq = UINT64_MAX;
+    for (uint32_t t = 0; t < MAX_TENANTS; ++t) {
+      if (!tenantHeadEligibleLocked(t)) continue;
+      if (queues_[t].front().seq < bestSeq) {
+        best = t;
+        bestSeq = queues_[t].front().seq;
+      }
+    }
+    return best;
+  }
+
+  // StrictPriority with continuous aging. Effective score is
+  // qos_class * aging_interval + queue_wait_ns, equivalent to P + lambda*W
+  // with lambda=1/aging_interval. Old low-priority work therefore eventually
+  // outranks newly arriving high-priority work.
   // - minClass (default BestEffort) lets Hybrid restrict the search to
   //   Premium/Realtime tenants.
-  // - Aging/starvation-prevention is intentionally disabled in this experiment
-  //   mode so priority results are not diluted by automatic promotion.
   // - Eligible only when the head is at the front of its connection queue
   //   (design.md §5.7.1).
   uint32_t pickStrictPriorityLocked(QoSClass minClass = QoSClass::BestEffort) {
     uint32_t best = MAX_TENANTS;
-    int bestPri = -1;
+    uint64_t bestScore = 0;
+    uint64_t bestSeq = UINT64_MAX;
+    uint64_t now = steadyNowNs();
     for (uint32_t t = 0; t < MAX_TENANTS; ++t) {
       if (!tenantHeadEligibleLocked(t)) continue;
       int basePri = static_cast<int>(tenants_[t].qos_class);
       if (basePri < static_cast<int>(minClass)) continue;
 
-      if (basePri > bestPri) {
-        bestPri = basePri;
+      const PendingTrigger& head = queues_[t].front();
+      uint64_t waitNs = now > head.ctx.enqueueNs ? now - head.ctx.enqueueNs : 0;
+      uint64_t score = static_cast<uint64_t>(basePri) * agingNs_ + waitNs;
+      if (best == MAX_TENANTS || score > bestScore || (score == bestScore && head.seq < bestSeq)) {
+        bestScore = score;
+        bestSeq = head.seq;
         best = t;
       }
     }
@@ -654,6 +728,9 @@ class TenantAwareProxyHandler {
   // DRR deficit (signed; can be temporarily negative after the escape hatch).
   std::array<int64_t, MAX_TENANTS> deficit_{};
   std::array<SchedulerDebugCounters, MAX_TENANTS> debugCounters_{};
+  std::array<std::atomic<uint64_t>, MAX_TENANTS> tenantCollectiveBytes_{};
+  std::atomic<uint64_t> smallCollectiveThresholdBytes_;
+  uint64_t agingNs_;
   std::atomic<bool> debug_{false};
   std::atomic<uint64_t> debugDispatchOrder_{0};
   uint64_t nextSeq_ = 0;
@@ -687,9 +764,12 @@ class TenantAwareProxyHandler {
 class TenantAwareProxyService : public ProxyService {
  public:
   TenantAwareProxyService(PolicyMode mode = PolicyMode::SinglePassthrough, int fifoSize = DEFAULT_FIFO_SIZE,
-                          uint32_t schedulingWindowSize = DEFAULT_SCHEDULING_WINDOW_SIZE, bool debug = false)
+                          uint32_t schedulingWindowSize = DEFAULT_SCHEDULING_WINDOW_SIZE, bool debug = false,
+                          uint64_t smallCollectiveThresholdBytes = DEFAULT_SMALL_COLLECTIVE_THRESHOLD_BYTES,
+                          uint64_t agingNs = DEFAULT_AGING_NS)
       : ProxyService(fifoSize),
-        handler_(std::make_shared<TenantAwareProxyHandler>(ContextProxyHandler{}, mode, schedulingWindowSize, debug)) {
+        handler_(std::make_shared<TenantAwareProxyHandler>(ContextProxyHandler{}, mode, schedulingWindowSize, debug,
+                                                           smallCollectiveThresholdBytes, agingNs)) {
     // The decorator captures handler_ (constructed BEFORE this lambda runs)
     // and installs it as the proxy's outer context-aware handler.
     // Using setContextHandlerDecorator (not setHandlerDecorator) is what
@@ -723,6 +803,19 @@ class TenantAwareProxyService : public ProxyService {
 
   void setMode(PolicyMode mode) { handler_->setMode(mode); }
   PolicyMode mode() const { return handler_->mode(); }
+
+  /// Associate a tenant's PortChannels with the total collective byte count.
+  void setTenantCollectiveBytes(TenantId tenantId, uint64_t bytes) {
+    handler_->setTenantCollectiveBytes(tenantId, bytes);
+  }
+
+  /// Configure the inclusive upper bound for the direct small-message path.
+  void setSmallCollectiveThresholdBytes(uint64_t bytes) {
+    handler_->setSmallCollectiveThresholdBytes(bytes);
+  }
+
+  /// Return the inclusive upper bound for the direct small-message path.
+  uint64_t smallCollectiveThresholdBytes() const { return handler_->smallCollectiveThresholdBytes(); }
 
   void setDebug(bool enabled) { handler_->setDebug(enabled); }
   bool debugEnabled() const { return handler_->debugEnabled(); }

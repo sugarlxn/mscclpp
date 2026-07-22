@@ -48,6 +48,7 @@ class PolicyMode(enum.IntEnum):
     FAIR               = 1
     STRICT_PRIORITY    = 2
     HYBRID             = 3
+    FIFO               = 4
 
 
 @dataclass
@@ -630,13 +631,16 @@ def _cpp_mode(mode: PolicyMode):
         PolicyMode.FAIR:               CppPolicyMode.Fair,
         PolicyMode.STRICT_PRIORITY:    CppPolicyMode.StrictPriority,
         PolicyMode.HYBRID:             CppPolicyMode.Hybrid,
+        PolicyMode.FIFO:               CppPolicyMode.Fifo,
     }[mode]
 
 
 def TenantAwareProxyService(mode: PolicyMode = PolicyMode.SINGLE_PASSTHROUGH,
                             fifo_size: int = 128,
                             scheduling_window_size: int = 5,
-                            debug: bool = False):
+                            debug: bool = False,
+                            small_collective_threshold_bytes: int = 4 * 1024 * 1024,
+                            aging_ns: int = 100 * 1000 * 1000):
     """Construct a C++ TenantAwareProxyService — drop-in replacement for
     mscclpp.ProxyService with per-tenant scheduling.
 
@@ -646,7 +650,10 @@ def TenantAwareProxyService(mode: PolicyMode = PolicyMode.SINGLE_PASSTHROUGH,
     from mscclpp._mscclpp import CppTenantAwareProxyService
     window = max(1, int(scheduling_window_size))
     try:
-        svc = CppTenantAwareProxyService(_cpp_mode(mode), fifo_size, window, bool(debug))
+        svc = CppTenantAwareProxyService(
+            _cpp_mode(mode), fifo_size, window, bool(debug),
+            int(small_collective_threshold_bytes), int(aging_ns)
+        )
     except TypeError:
         svc = CppTenantAwareProxyService(_cpp_mode(mode), fifo_size, window)
         if debug:

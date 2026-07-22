@@ -53,7 +53,7 @@ except ImportError:
         MscclppAllReduce5,
     )
 
-from mscclpp import CommGroup, GpuBuffer  # noqa: E402
+from mscclpp import CommGroup, GpuBuffer, ProxyService  # noqa: E402
 from mscclpp.ext.tenant import (  # noqa: E402
     PolicyMode,
     QoSClass,
@@ -64,6 +64,7 @@ from mscclpp.ext.tenant import (  # noqa: E402
 
 CSV_FIELDS = [
     "run_id",
+    "trial",
     "timestamp",
     "scenario",
     "backend",
@@ -72,6 +73,9 @@ CSV_FIELDS = [
     "tenant_name",
     "qos_class",
     "policy",
+    "scheduler_variant",
+    "small_threshold_bytes",
+    "size_class",
     "configured_weight",
     "size_bytes",
     "size_human",
@@ -89,6 +93,8 @@ CSV_FIELDS = [
     "dtype",
     "sched_dispatched_triggers",
     "sched_dispatched_bytes",
+    "size_aware_bypass_triggers",
+    "size_aware_bypass_bytes",
     "token_bucket_waits",
     "drr_picks",
     "strict_priority_picks",
@@ -311,15 +317,18 @@ def validate_xnode_ar4_size(nelems: int, dtype, world_size: int, nranks_per_node
         )
 
 
-def make_cpp_mt_algo(group, memory, memory_out, proxy_service, nranks_per_node: int):
+def make_cpp_mt_algo(group, memory, memory_out, proxy_service, nranks_per_node: int, algorithm: str = "auto"):
     if group.nranks == nranks_per_node:
         return MscclppAllReduce3(group, memory, proxy_service), assign_tenant_to_allreduce3
 
-    if memory.nbytes < (1 << 22):
+    if algorithm == "ar5" or (algorithm == "auto" and memory.nbytes <= (1 << 22)):
         return (
             MscclppAllReduce5(group, memory, memory_out, nranks_per_node, proxy_service),
             assign_tenant_to_allreduce5,
         )
+
+    if algorithm not in {"auto", "ar4"}:
+        raise ValueError(f"unsupported cross-node algorithm {algorithm!r}")
 
     validate_xnode_ar4_size(memory.size, memory.dtype, group.nranks, nranks_per_node)
     return (
@@ -337,6 +346,12 @@ def make_scenario_specs(rate_cap_gbps: float) -> dict[str, ScenarioSpec]:
     tenant_b = "tenantB"
     tenant_c = "tenantC"
     return {
+        "single": ScenarioSpec(
+            name="single_tenant",
+            policy="single_tenant",
+            mode=PolicyMode.STRICT_PRIORITY,
+            tenants=(TenantSpec(1, "tenantA", QoSClass.STANDARD, 1),),
+        ),
         "infer_priority": ScenarioSpec(
             name="mtccl_infer_priority_3tenant",
             policy="strict_priority",
@@ -414,12 +429,13 @@ def normalize_scenarios(raw: str, specs: dict[str, ScenarioSpec]) -> list[Scenar
         "cpp_mt_priority": "priority",
         "cpp_mt_weighted": "weighted",
         "cpp_mt_rate_limited": "rate_limited",
+        "single_tenant": "single",
     }
     requested = [part.strip() for part in raw.split(",") if part.strip()]
     if not requested:
         raise ValueError("--scenarios cannot be empty")
     if "all" in requested:
-        requested = ["infer_priority", "equal_priority", "fair", "priority", "weighted", "rate_limited"]
+        requested = ["single", "infer_priority", "equal_priority", "fair", "priority", "weighted", "rate_limited"]
 
     out = []
     seen = set()
@@ -434,6 +450,7 @@ def normalize_scenarios(raw: str, specs: dict[str, ScenarioSpec]) -> list[Scenar
                 "weighted",
                 "rate_limited",
                 "all",
+                "single",
             ])
             raise ValueError(f"unknown scenario {name!r}; valid values: {valid}")
         if key not in seen:
@@ -496,10 +513,14 @@ def kstream_enabled(single_stream: bool) -> bool:
     return True
 
 
-def backend_label(mode: PolicyMode, use_k_streams: bool) -> str:
+def backend_label(variant: str, mode: PolicyMode, use_k_streams: bool) -> str:
     suffix = "kstream" if use_k_streams else "single_stream_smoke"
+    if variant == "native":
+        return f"mscclpp_native_{suffix}"
+    if variant == "fifo":
+        return f"mscclpp_size_aware_fifo_{suffix}"
     if mode == PolicyMode.STRICT_PRIORITY:
-        return f"mscclpp_cpp_mt_strict_priority_{suffix}"
+        return f"tapcs_size_aware_priority_{suffix}"
     if mode == PolicyMode.HYBRID:
         return f"mscclpp_cpp_mt_hybrid_{suffix}"
     return f"mscclpp_cpp_mt_fair_{suffix}"
@@ -521,6 +542,11 @@ def run_cpp_scenario(
     sched_window_size: int,
     proxy_debug: bool,
     inference_delay_ms: float,
+    variant: str,
+    small_threshold_bytes: int,
+    aging_ns: int,
+    algorithm: str,
+    trial: int,
 ) -> list[dict]:
     rows = []
     ops_by_tenant = parse_ops(ops_arg, scenario.tenants, niter)
@@ -531,20 +557,29 @@ def run_cpp_scenario(
     ) + tuple(tenant for tenant in scenario.tenants if tenant.name == "inference")
 
     for size_profile in size_profiles:
-        proxy_service = TenantAwareProxyService(
-            mode=scenario.mode,
-            scheduling_window_size=sched_window_size,
-            debug=proxy_debug,
-        )
-        for tenant in scenario.tenants:
-            register_tenant_on(
-                proxy_service,
-                tenant.tenant_id,
-                tenant.qos,
-                tenant.weight,
-                int(tenant.bandwidth_cap_bps),
-                0,
+        if variant == "native":
+            proxy_service = ProxyService()
+        else:
+            mode = PolicyMode.FIFO if variant == "fifo" else scenario.mode
+            proxy_service = TenantAwareProxyService(
+                mode=mode,
+                scheduling_window_size=sched_window_size,
+                debug=proxy_debug,
+                small_collective_threshold_bytes=small_threshold_bytes,
+                aging_ns=aging_ns,
             )
+            for tenant in scenario.tenants:
+                register_tenant_on(
+                    proxy_service,
+                    tenant.tenant_id,
+                    tenant.qos,
+                    tenant.weight,
+                    int(tenant.bandwidth_cap_bps),
+                    0,
+                )
+                proxy_service.set_tenant_collective_bytes(
+                    tenant.tenant_id, size_profile[tenant.tenant_id]
+                )
 
         proxy_service.start_proxy()
         try:
@@ -561,6 +596,7 @@ def run_cpp_scenario(
                     memory_out,
                     proxy_service,
                     nranks_per_node,
+                    algorithm,
                 )
                 assign_tenant(algo, tenant.tenant_id)
                 algos[tenant.tenant_id] = (algo, memory)
@@ -663,7 +699,7 @@ def run_cpp_scenario(
                     if hasattr(proxy_service, "scheduler_debug_counters")
                     else {}
                 )
-                backend = backend_label(scenario.mode, use_k_streams)
+                backend = backend_label(variant, scenario.mode, use_k_streams)
                 for tenant in scenario.tenants:
                     tid = tenant.tenant_id
                     sched = counters.get(tid, {})
@@ -675,6 +711,7 @@ def run_cpp_scenario(
                     bytes_sent = actual_size_bytes * ops
                     row = {
                         "run_id": run_id,
+                        "trial": trial,
                         "timestamp": datetime.utcnow().isoformat(),
                         "scenario": scenario.name,
                         "backend": backend,
@@ -683,6 +720,13 @@ def run_cpp_scenario(
                         "tenant_name": tenant.name,
                         "qos_class": tenant.qos.name,
                         "policy": scenario.policy,
+                        "scheduler_variant": variant,
+                        "small_threshold_bytes": small_threshold_bytes,
+                        "size_class": (
+                            "small"
+                            if actual_size_bytes <= small_threshold_bytes
+                            else "large"
+                        ),
                         "configured_weight": tenant.weight,
                         "size_bytes": actual_size_bytes,
                         "size_human": human_size(actual_size_bytes),
@@ -703,6 +747,12 @@ def run_cpp_scenario(
                         ),
                         "sched_dispatched_bytes": int(
                             sched.get("sched_dispatched_bytes", 0)
+                        ),
+                        "size_aware_bypass_triggers": int(
+                            sched.get("size_aware_bypass_triggers", 0)
+                        ),
+                        "size_aware_bypass_bytes": int(
+                            sched.get("size_aware_bypass_bytes", 0)
                         ),
                         "token_bucket_waits": int(sched.get("token_bucket_waits", 0)),
                         "drr_picks": int(sched.get("drr_picks", 0)),
@@ -729,7 +779,7 @@ def run_cpp_scenario(
                         else ""
                     )
                     print(
-                        f"  [{scenario.name} {tenant.name} {tenant.qos.name}"
+                        f"  [{variant} {scenario.name} {tenant.name} {tenant.qos.name}"
                         f" w={tenant.weight} ops={ops}{cap}] "
                         f"{row['size_human']:>8s} {time_us:9.2f} us/op "
                         f"job={job_time_us / 1000.0:9.3f} ms "
@@ -808,6 +858,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--niter", type=int, default=50)
     parser.add_argument(
+        "--trials",
+        type=int,
+        default=1,
+        help="Independent contention trials; use >=10 for P50/P95/P99 analysis.",
+    )
+    parser.add_argument(
+        "--algorithm",
+        choices=["auto", "ar4", "ar5"],
+        default="auto",
+        help="Cross-node AllReduce implementation. Use ar5 for the exact threshold sweep.",
+    )
+    parser.add_argument(
         "--ops",
         default=None,
         help=(
@@ -819,9 +881,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--scenarios",
         default="infer_priority,equal_priority",
         help=(
-            "Comma list: infer_priority,equal_priority,fair,priority,"
+            "Comma list: single,infer_priority,equal_priority,fair,priority,"
             "weighted,rate_limited,all."
         ),
+    )
+    parser.add_argument(
+        "--variants",
+        default="native,fifo,tapcs",
+        help="Comparison backends: native,size-aware FIFO baseline,TAPCS.",
+    )
+    parser.add_argument(
+        "--small-threshold-bytes",
+        default="4MiB",
+        help="Fixed TAPCS small/large boundary (default: 4MiB).",
+    )
+    parser.add_argument(
+        "--aging-ms",
+        type=float,
+        default=100.0,
+        help="Priority aging interval in milliseconds.",
     )
     parser.add_argument(
         "--rate-cap-gbps",
@@ -871,6 +949,8 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.niter <= 0:
         raise ValueError("--niter must be positive")
+    if args.trials <= 0:
+        raise ValueError("--trials must be positive")
     args.sched_window_size = max(1, int(args.sched_window_size))
 
     dtype = dtype_from_arg(args.dtype)
@@ -889,6 +969,14 @@ def main() -> int:
 
     scenario_specs = make_scenario_specs(args.rate_cap_gbps)
     scenarios = normalize_scenarios(args.scenarios, scenario_specs)
+    variants = [value.strip().lower() for value in args.variants.split(",") if value.strip()]
+    aliases = {"priority": "tapcs", "proposed": "tapcs", "size_fifo": "fifo"}
+    variants = [aliases.get(value, value) for value in variants]
+    invalid_variants = sorted(set(variants) - {"native", "fifo", "tapcs"})
+    if invalid_variants:
+        raise ValueError(f"unknown --variants values: {invalid_variants}")
+    small_threshold_bytes = parse_size_bytes(args.small_threshold_bytes)
+    aging_ns = max(1, int(args.aging_ms * 1_000_000))
     use_k_streams = kstream_enabled(args.single_stream)
     use_cuda_graph = not args.no_cuda_graph
 
@@ -936,6 +1024,11 @@ def main() -> int:
             "Scenarios: " + ", ".join(scenario.name for scenario in scenarios),
             flush=True,
         )
+        print(
+            f"Variants: {','.join(variants)}; small/large boundary="
+            f"{human_size(small_threshold_bytes)}; aging={args.aging_ms:g}ms",
+            flush=True,
+        )
         print("", flush=True)
 
     for scenario in scenarios:
@@ -951,25 +1044,32 @@ def main() -> int:
                     "    sizes: " + describe_size_profile(profile, scenario.tenants),
                     flush=True,
                 )
-        rows.extend(
-            run_cpp_scenario(
-                scenario=scenario,
-                size_profiles=size_profiles,
-                niter=args.niter,
-                ops_arg=args.ops,
-                dtype=dtype,
-                group=group,
-                comm=comm,
-                rank=rank,
-                nranks_per_node=nranks_per_node,
-                run_id=run_id,
-                use_cuda_graph=use_cuda_graph,
-                use_k_streams=use_k_streams,
-                sched_window_size=args.sched_window_size,
-                proxy_debug=args.proxy_debug,
-                inference_delay_ms=args.inference_delay_ms,
-            )
-        )
+        for variant in variants:
+            for trial in range(args.trials):
+                rows.extend(
+                    run_cpp_scenario(
+                    scenario=scenario,
+                    size_profiles=size_profiles,
+                    niter=args.niter,
+                    ops_arg=args.ops,
+                    dtype=dtype,
+                    group=group,
+                    comm=comm,
+                    rank=rank,
+                    nranks_per_node=nranks_per_node,
+                    run_id=run_id,
+                    use_cuda_graph=use_cuda_graph,
+                    use_k_streams=use_k_streams,
+                    sched_window_size=args.sched_window_size,
+                    proxy_debug=args.proxy_debug,
+                    inference_delay_ms=args.inference_delay_ms,
+                    variant=variant,
+                    small_threshold_bytes=small_threshold_bytes,
+                    aging_ns=aging_ns,
+                    algorithm=args.algorithm,
+                    trial=trial,
+                    )
+                )
 
     if rank == 0:
         write_csv(args.out, rows)
